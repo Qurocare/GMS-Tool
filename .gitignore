@@ -1,0 +1,11 @@
+# Local Python environment and generated files
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local pilot database: never upload provider records or local passwords
+data/*.db
+data/*.db-*
+
+# Deployment secrets must be configured in Streamlit Cloud, never committed
+.streamlit/secrets.toml
