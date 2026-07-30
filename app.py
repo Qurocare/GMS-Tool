@@ -122,6 +122,9 @@ def dashboard_page(user: dict) -> None:
     st.title("Growth operations dashboard")
     st.caption("Shared operational view. Individual records remain restricted to their owner.")
     providers = frame("SELECT * FROM providers ORDER BY date_added DESC")
+    # Temporary display value. Replace with the agreed aggregate provider-app
+    # data source after the Tech team confirms the DAP event definition.
+    dap_today = 0
     total = len(providers)
     active = int((providers.stage == "Active Provider").sum()) if total else 0
     demos = int(providers.stage.isin(["Demo Scheduled", "Demo Completed"]).sum()) if total else 0
@@ -134,8 +137,11 @@ def dashboard_page(user: dict) -> None:
         st.metric("Demos", demos, border=True)
         st.metric("Onboarding", onboarding, border=True)
         st.metric("Active providers", active, border=True)
+        st.metric("Daily active providers (DAP)", dap_today, border=True,
+                  help="Currently shown as 0 until the provider-app data integration is available.")
         st.metric("Conversion", f"{conversion:.1f}%", border=True)
         st.metric("Follow-ups due", due, border=True)
+    st.caption("DAP is temporarily set to 0. It will update automatically after Tech connects the agreed provider-app data source.")
 
     col_a, col_b = st.columns((1.2, 1))
     with col_a:
