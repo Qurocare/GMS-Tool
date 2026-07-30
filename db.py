@@ -29,7 +29,8 @@ ROLE_MO = "Medical Officer"
 ROLE_ML = "Market Lead"
 ROLE_BDM = "Business Development Manager"
 ROLE_CEO = "CEO/Admin"
-ROLES = [ROLE_PSM, ROLE_MO, ROLE_ML, ROLE_BDM, ROLE_CEO]
+ROLE_DISPLAY = "Display only"
+ROLES = [ROLE_PSM, ROLE_MO, ROLE_ML, ROLE_BDM, ROLE_CEO, ROLE_DISPLAY]
 DEFAULT_TEAM = [("Reshma", ROLE_PSM), ("Dr. Asinsha", ROLE_MO), ("Halifa", ROLE_ML), ("Rahul", ROLE_BDM)]
 
 
