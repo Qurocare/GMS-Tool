@@ -8,7 +8,7 @@ import streamlit as st
 
 from db import (
     DEFAULT_TEAM, FEEDBACK_CATEGORIES, FEEDBACK_STATUSES, PRIORITIES, PROVIDER_TYPES,
-    ROLE_BDM, ROLE_CEO, ROLE_ML, ROLE_MO, ROLE_PSM, SOURCES, STAGES, authenticate,
+    ROLE_BDM, ROLE_CEO, ROLE_DISPLAY, ROLE_ML, ROLE_MO, ROLE_PSM, SOURCES, STAGES, authenticate,
     create_user, execute, frame, initialise, user_count, user_label, users_frame,
 )
 
@@ -171,7 +171,7 @@ def build_scorecards() -> pd.DataFrame:
     users = users_frame()
     # Deactivated accounts remain in the audit trail but are not operational
     # team members and should not appear on the shared scorecard.
-    users = users[users.is_active == 1]
+    users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY)]
     role_order = {
         ROLE_ML: 0,
         ROLE_BDM: 1,
@@ -405,7 +405,10 @@ def user_management_page(user: dict) -> None:
     st.title("Team access")
     st.caption("Only Reshma, PSM and CEO/Admin can create local pilot accounts.")
     with st.form("new_user", clear_on_submit=True):
-        team_options = [f"{name}|{role}" for name, role in DEFAULT_TEAM] + [f"CEO|{ROLE_CEO}"]
+        team_options = [f"{name}|{role}" for name, role in DEFAULT_TEAM] + [
+            f"CEO|{ROLE_CEO}",
+            f"LG display|{ROLE_DISPLAY}",
+        ]
         selected = st.selectbox("Team member", team_options)
         name, role = selected.split("|", 1)
         email = st.text_input("Work email")
@@ -456,9 +459,12 @@ def main_app() -> None:
             st.session_state["gms_user"] = None
             st.rerun()
         st.divider()
-        pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback", "Handoff reviews"]
-        if is_management(user):
-            pages.append("Team access")
+        if user["role"] == ROLE_DISPLAY:
+            pages = ["Dashboard"]
+        else:
+            pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback", "Handoff reviews"]
+            if is_management(user):
+                pages.append("Team access")
         page = st.radio("Navigate", pages)
         st.caption("Local pilot - migrate to Supabase Auth before deployment.")
     if page == "Dashboard":
