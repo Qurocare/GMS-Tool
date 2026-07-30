@@ -169,6 +169,18 @@ def dashboard_page(user: dict) -> None:
 
 def build_scorecards() -> pd.DataFrame:
     users = users_frame()
+    # Deactivated accounts remain in the audit trail but are not operational
+    # team members and should not appear on the shared scorecard.
+    users = users[users.is_active == 1]
+    role_order = {
+        ROLE_ML: 0,
+        ROLE_BDM: 1,
+        ROLE_MO: 2,
+        ROLE_PSM: 3,
+        ROLE_CEO: 4,
+    }
+    users = users.assign(_scorecard_order=users.role.map(role_order).fillna(99))
+    users = users.sort_values(["_scorecard_order", "id"])
     activities = frame("SELECT ra.*, u.name, u.role FROM role_activities ra JOIN users u ON u.id = ra.user_id")
     reviews = frame("SELECT submitted_by_user_id, outcome FROM handoff_reviews")
     rows = []
@@ -407,8 +419,32 @@ def user_management_page(user: dict) -> None:
                     st.success(f"Account created for {name}.")
                 except Exception:
                     st.error("An account with that email already exists.")
+    accounts = users_frame()
+    other_accounts = accounts[accounts.id != user["id"]]
+    if not other_accounts.empty:
+        st.divider()
+        st.subheader("Deactivate account")
+        st.caption("Deactivated accounts cannot sign in and will not appear on the team scorecard. Their past records are retained.")
+        account_options = other_accounts.id.tolist()
+        selected_account_id = st.selectbox(
+            "Select account to deactivate",
+            account_options,
+            format_func=lambda account_id: (
+                f"{other_accounts[other_accounts.id == account_id].iloc[0]['name']} — "
+                f"{other_accounts[other_accounts.id == account_id].iloc[0]['email']}"
+            ),
+        )
+        selected_account = other_accounts[other_accounts.id == selected_account_id].iloc[0]
+        if selected_account.is_active:
+            if st.button("Deactivate selected account", type="secondary"):
+                execute("UPDATE users SET is_active=0 WHERE id=?", (selected_account_id,))
+                st.success(f"{selected_account['name']} has been deactivated.")
+                st.rerun()
+        else:
+            st.info("This account is already deactivated.")
     st.subheader("Current accounts")
-    st.dataframe(users_frame().drop(columns=["id"]), hide_index=True, width="stretch")
+    accounts["access_status"] = accounts.is_active.map({1: "Active", 0: "Deactivated"})
+    st.dataframe(accounts.drop(columns=["id", "is_active"]), hide_index=True, width="stretch")
 
 
 def main_app() -> None:
