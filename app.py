@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 
 from db import (
     DEFAULT_TEAM, FEEDBACK_CATEGORIES, FEEDBACK_STATUSES, PRIORITIES, PROVIDER_TYPES,
-    ROLE_BDM, ROLE_CEO, ROLE_DISPLAY, ROLE_ML, ROLE_MO, ROLE_PSM, SOURCES, STAGES, authenticate,
+    ROLE_BDM, ROLE_CEO, ROLE_DISPLAY, ROLE_ML, ROLE_MO, ROLE_PGA, ROLE_PSM, SOURCES, STAGES, authenticate,
     create_user, execute, frame, initialise, user_count, user_label, users_frame,
 )
 
@@ -19,29 +19,29 @@ st.session_state.setdefault("gms_user", None)
 ACTIVITY_FIELDS = {
     ROLE_ML: [
         ("providers_researched", "Providers researched"),
-        ("leads_qualified", "Leads qualified"),
-        ("leads_submitted", "Leads submitted to Rahul"),
+        ("meaningful_conversations", "Meaningful provider conversations"),
+        ("leads_qualified", "Qualified interested leads added to GMS"),
     ],
     ROLE_BDM: [
-        ("calls_attempted", "Calls attempted"),
-        ("contacts_connected", "Contacts connected"),
-        ("interested_leads", "Interested leads"),
+        ("qualified_leads_contacted", "Qualified leads contacted"),
         ("demos_scheduled", "Demos scheduled"),
         ("followups_completed", "Follow-ups completed"),
     ],
     ROLE_PSM: [
+        ("demo_ready_providers_contacted", "Demo-ready providers contacted"),
         ("demos_conducted", "Demos conducted"),
+        ("providers_ready_for_onboarding", "Providers ready for onboarding"),
         ("feedback_logged", "Provider feedback logged"),
         ("tech_followups", "Tech follow-ups"),
-        ("activation_coordination", "Activation coordination"),
     ],
     ROLE_MO: [
         ("demos_supported", "Demos supported"),
+        ("providers_received_for_verification", "Providers received for verification"),
         ("documents_reviewed", "Documents reviewed"),
         ("verifications_completed", "Verifications completed"),
-        ("compliance_completed", "Legal/compliance packs completed"),
-        ("onboarding_ready", "Providers ready for onboarding"),
+        ("providers_ready_to_activate", "Providers ready to activate"),
     ],
+    ROLE_PGA: [],
     ROLE_CEO: [],
 }
 
@@ -52,6 +52,18 @@ def current_user() -> dict:
 
 def is_management(user: dict) -> bool:
     return user["role"] in {ROLE_PSM, ROLE_CEO}
+
+
+def rahul_owner() -> tuple[str, int] | None:
+    """Return Rahul's active BDM account when it has been created."""
+    users = frame(
+        "SELECT id, name, role FROM users WHERE role=? AND is_active=1 ORDER BY id LIMIT 1",
+        (ROLE_BDM,),
+    )
+    if users.empty:
+        return None
+    owner = users.iloc[0]
+    return f"{owner.name}, {owner.role}", int(owner.id)
 
 
 def export_button(data: pd.DataFrame, name: str) -> None:
@@ -143,6 +155,33 @@ def dashboard_page(user: dict) -> None:
         st.metric("Follow-ups due", due, border=True)
     st.caption("DAP is temporarily set to 0. It will update automatically after Tech connects the agreed provider-app data source.")
 
+    st.subheader("Team performance period")
+    period = st.segmented_control(
+        "Choose scorecard period",
+        ["Today", "This week", "This month", "Custom range"],
+        default="Today",
+        key="scorecard_period",
+    )
+    today = date.today()
+    if period == "This week":
+        start_date, end_date = today - timedelta(days=today.weekday()), today
+    elif period == "This month":
+        start_date, end_date = today.replace(day=1), today
+    elif period == "Custom range":
+        selected_range = st.date_input(
+            "Choose start and end dates",
+            value=(today - timedelta(days=6), today),
+            max_value=today,
+            key="scorecard_custom_range",
+        )
+        if isinstance(selected_range, tuple) and len(selected_range) == 2:
+            start_date, end_date = selected_range
+        else:
+            start_date = end_date = selected_range if isinstance(selected_range, date) else today
+    else:
+        start_date = end_date = today
+    st.caption(f"Scorecards below use activity submitted from {start_date.strftime('%d %b %Y')} to {end_date.strftime('%d %b %Y')}.")
+
     col_a, col_b = st.columns((1.2, 1))
     with col_a:
         with st.container(border=True):
@@ -153,7 +192,7 @@ def dashboard_page(user: dict) -> None:
     with col_b:
         with st.container(border=True):
             st.subheader("Team scorecards")
-            scorecards = build_scorecards()
+            scorecards = build_scorecards(start_date, end_date)
             st.dataframe(scorecards, hide_index=True, width="stretch")
 
     with st.container(border=True):
@@ -166,8 +205,67 @@ def dashboard_page(user: dict) -> None:
         else:
             st.info("No provider records yet.")
 
+    with st.container(border=True):
+        st.subheader("Daily activity calendar")
+        selected_day = st.date_input(
+            "Select a day to review team activity",
+            value=today,
+            max_value=today,
+            key="daily_activity_date",
+        )
+        st.caption("This shows whether each scored team member submitted activity on the selected date, with that day’s outcome measure.")
+        daily_activity = build_daily_activity_summary(selected_day)
+        st.dataframe(daily_activity, hide_index=True, width="stretch")
 
-def build_scorecards() -> pd.DataFrame:
+
+def activity_metrics_for_user(activities: pd.DataFrame, user_id: int) -> tuple[dict, bool]:
+    """Add all activity values for one user and report whether they submitted."""
+    metrics: dict[str, int] = {}
+    if activities.empty:
+        return metrics, False
+    entries = activities[activities.user_id == user_id]
+    for value in entries.metrics_json:
+        metrics.update({key: metrics.get(key, 0) + int(number) for key, number in json.loads(value).items()})
+    return metrics, not entries.empty
+
+
+def scorecard_measure(role: str, metrics: dict) -> tuple[str, str] | None:
+    """Return the outcome measure and supporting evidence for a role."""
+    if role == ROLE_ML:
+        conversations = metrics.get("meaningful_conversations", 0)
+        qualified = metrics.get("leads_qualified", 0)
+        return (
+            f"{(qualified / conversations * 100) if conversations else 0:.0f}% quality lead rate",
+            f"{qualified} qualified leads from {conversations} conversations",
+        )
+    if role == ROLE_BDM:
+        contacted = metrics.get("qualified_leads_contacted", 0)
+        demos = metrics.get("demos_scheduled", 0)
+        return (
+            f"{(demos / contacted * 100) if contacted else 0:.0f}% demo scheduling rate",
+            f"{demos} demos from {contacted} qualified leads contacted",
+        )
+    if role == ROLE_MO:
+        received = metrics.get("providers_received_for_verification", 0)
+        verified = metrics.get("verifications_completed", 0)
+        ready = metrics.get("providers_ready_to_activate", 0)
+        return (
+            f"{(verified / received * 100) if received else 0:.0f}% verification completion",
+            f"{ready} ready to activate after {verified} verifications",
+        )
+    if role == ROLE_PSM:
+        demos = metrics.get("demos_conducted", 0)
+        ready = metrics.get("providers_ready_for_onboarding", 0)
+        return (
+            f"{(ready / demos * 100) if demos else 0:.0f}% onboarding-ready rate",
+            f"{ready} onboarding-ready from {demos} demos",
+        )
+    if role == ROLE_CEO:
+        return "Management review", "CEO/Admin view"
+    return None
+
+
+def build_scorecards(start_date: date, end_date: date) -> pd.DataFrame:
     users = users_frame()
     # Deactivated accounts remain in the audit trail but are not operational
     # team members and should not appear on the shared scorecard.
@@ -181,36 +279,48 @@ def build_scorecards() -> pd.DataFrame:
     }
     users = users.assign(_scorecard_order=users.role.map(role_order).fillna(99))
     users = users.sort_values(["_scorecard_order", "id"])
-    activities = frame("SELECT ra.*, u.name, u.role FROM role_activities ra JOIN users u ON u.id = ra.user_id")
-    reviews = frame("SELECT submitted_by_user_id, outcome FROM handoff_reviews")
+    activities = frame(
+        """SELECT ra.*, u.name, u.role FROM role_activities ra
+           JOIN users u ON u.id = ra.user_id
+           WHERE ra.activity_date BETWEEN ? AND ?""",
+        (start_date.isoformat(), end_date.isoformat()),
+    )
     rows = []
     for user in users.itertuples():
-        metrics = {}
-        if not activities.empty:
-            for value in activities[activities.user_id == user.id].metrics_json:
-                metrics.update({k: metrics.get(k, 0) + int(v) for k, v in json.loads(value).items()})
-        if user.role == ROLE_ML:
-            subset = reviews[reviews.submitted_by_user_id == user.id] if not reviews.empty else pd.DataFrame()
-            reviewed = len(subset)
-            accepted = int((subset.outcome == "Accepted").sum()) if reviewed else 0
-            measure = f"{(accepted / reviewed * 100) if reviewed else 0:.0f}% lead acceptance"
-            evidence = f"{metrics.get('leads_submitted', 0)} leads submitted"
-        elif user.role == ROLE_BDM:
-            connected = metrics.get("contacts_connected", 0)
-            demos = metrics.get("demos_scheduled", 0)
-            measure = f"{(demos / connected * 100) if connected else 0:.0f}% demo conversion"
-            evidence = f"{demos} demos scheduled"
-        elif user.role == ROLE_MO:
-            docs = metrics.get("documents_reviewed", 0)
-            verified = metrics.get("verifications_completed", 0)
-            measure = f"{(verified / docs * 100) if docs else 0:.0f}% verification completion"
-            evidence = f"{metrics.get('compliance_completed', 0)} compliance packs"
-        elif user.role == ROLE_PSM:
-            measure = f"{metrics.get('demos_conducted', 0)} demos conducted"
-            evidence = f"{metrics.get('feedback_logged', 0)} feedback items"
-        else:
-            measure, evidence = "Management review", "CEO/Admin view"
+        metrics, _ = activity_metrics_for_user(activities, user.id)
+        result = scorecard_measure(user.role, metrics)
+        if result is None:
+            continue
+        measure, evidence = result
         rows.append({"Team member": f"{user.name}, {user.role}", "Main measure": measure, "Evidence": evidence})
+    return pd.DataFrame(rows)
+
+
+def build_daily_activity_summary(activity_date: date) -> pd.DataFrame:
+    """Build a shared, read-only daily review for the operational team."""
+    users = users_frame()
+    users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY)]
+    role_order = {ROLE_ML: 0, ROLE_BDM: 1, ROLE_MO: 2, ROLE_PSM: 3, ROLE_CEO: 4}
+    users = users.assign(_daily_order=users.role.map(role_order).fillna(99)).sort_values(["_daily_order", "id"])
+    activities = frame(
+        "SELECT * FROM role_activities WHERE activity_date=?",
+        (activity_date.isoformat(),),
+    )
+    rows = []
+    for user in users.itertuples():
+        metrics, submitted = activity_metrics_for_user(activities, user.id)
+        result = scorecard_measure(user.role, metrics)
+        if result is None or user.role == ROLE_CEO:
+            continue
+        measure, evidence = result
+        rows.append(
+            {
+                "Team member": f"{user.name}, {user.role}",
+                "Activity submitted": "Yes" if submitted else "No",
+                "Daily measure": measure,
+                "Evidence": evidence,
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -230,17 +340,24 @@ def my_leads_page(user: dict) -> None:
             email = b.text_input("Email")
             source = choose_or_specify("Lead source", SOURCES, "new_source")
             a, b, c = st.columns(3)
-            stage = a.selectbox("Current stage", STAGES, index=STAGES.index("Research") if user["role"] == ROLE_ML else STAGES.index("New Lead"))
+            default_stage = "Interested" if user["role"] in {ROLE_ML, ROLE_PGA} else "New Lead"
+            stage = a.selectbox("Current stage", STAGES, index=STAGES.index(default_stage))
             priority = b.selectbox("Priority", PRIORITIES, index=1)
             followup = c.date_input("Next follow-up", value=date.today())
             notes = st.text_area("Remarks")
-            st.caption(f"Owner: {user_label(user)}")
+            auto_assign_to_rahul = user["role"] in {ROLE_ML, ROLE_PGA}
+            if auto_assign_to_rahul and rahul_owner():
+                st.caption("This qualified lead will be assigned to Rahul automatically.")
+            else:
+                st.caption(f"Owner: {user_label(user)}")
             if st.form_submit_button("Save provider lead", type="primary"):
                 if not company.strip():
                     st.error("Provider name is required.")
                 else:
+                    owner = rahul_owner() if auto_assign_to_rahul else None
+                    assigned_to, assigned_to_user_id = owner if owner else (user_label(user), user["id"])
                     execute("""INSERT INTO providers (company_name, provider_type, contact_name, phone, email, source, assigned_to, assigned_to_user_id, created_by_user_id, updated_by_user_id, stage, priority, date_added, next_follow_up, remarks, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, user_label(user), user["id"], user["id"], user["id"], stage, priority, date.today().isoformat(), followup.isoformat(), notes.strip()))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, user["id"], user["id"], stage, priority, date.today().isoformat(), followup.isoformat(), notes.strip()))
                     st.success("Provider lead saved.")
                     st.rerun()
     st.subheader("My lead register")
@@ -278,7 +395,7 @@ def my_activity_page(user: dict) -> None:
     st.title("My activity")
     fields = ACTIVITY_FIELDS[user["role"]]
     if not fields:
-        st.info("CEO/Admin accounts do not submit operational activity.")
+        st.info("This account does not submit operational activity.")
         return
     st.caption(f"Your activity is saved as {user_label(user)}. Only you can edit these entries.")
     with st.form("new_activity", clear_on_submit=True):
@@ -461,6 +578,8 @@ def main_app() -> None:
         st.divider()
         if user["role"] == ROLE_DISPLAY:
             pages = ["Dashboard"]
+        elif user["role"] == ROLE_PGA:
+            pages = ["Dashboard", "My provider leads"]
         else:
             pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback", "Handoff reviews"]
             if is_management(user):
