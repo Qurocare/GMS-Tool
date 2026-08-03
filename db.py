@@ -28,10 +28,17 @@ ROLE_PSM = "PSM"
 ROLE_MO = "Medical Officer"
 ROLE_ML = "Market Lead"
 ROLE_BDM = "Business Development Manager"
+ROLE_PGA = "Product Growth Associate"
 ROLE_CEO = "CEO/Admin"
 ROLE_DISPLAY = "Display only"
-ROLES = [ROLE_PSM, ROLE_MO, ROLE_ML, ROLE_BDM, ROLE_CEO, ROLE_DISPLAY]
-DEFAULT_TEAM = [("Reshma", ROLE_PSM), ("Dr. Asinsha", ROLE_MO), ("Halifa", ROLE_ML), ("Rahul", ROLE_BDM)]
+ROLES = [ROLE_PSM, ROLE_MO, ROLE_ML, ROLE_BDM, ROLE_PGA, ROLE_CEO, ROLE_DISPLAY]
+DEFAULT_TEAM = [
+    ("Halifa", ROLE_ML),
+    ("Rahul", ROLE_BDM),
+    ("Dr. Asinsha", ROLE_MO),
+    ("Reshma", ROLE_PSM),
+    ("Simoy", ROLE_PGA),
+]
 
 
 def connect() -> sqlite3.Connection:
