@@ -54,16 +54,28 @@ def is_management(user: dict) -> bool:
     return user["role"] in {ROLE_PSM, ROLE_CEO}
 
 
-def rahul_owner() -> tuple[str, int] | None:
-    """Return Rahul's active BDM account when it has been created."""
+def owner_for_role(role: str) -> tuple[str, int] | None:
+    """Return the active GMS account responsible for a workflow role."""
     users = frame(
         "SELECT id, name, role FROM users WHERE role=? AND is_active=1 ORDER BY id LIMIT 1",
-        (ROLE_BDM,),
+        (role,),
     )
     if users.empty:
         return None
     owner = users.iloc[0]
     return f"{owner.name}, {owner.role}", int(owner.id)
+
+
+def workflow_owner_for_stage(stage: str) -> tuple[str, int] | None:
+    """Return the next owner when a provider reaches a handoff stage."""
+    handoff_roles = {
+        "Demo Scheduled": ROLE_PSM,
+        "Verification": ROLE_MO,
+        "Onboarding": ROLE_PSM,
+        "Active Provider": ROLE_PSM,
+    }
+    role = handoff_roles.get(stage)
+    return owner_for_role(role) if role else None
 
 
 def export_button(data: pd.DataFrame, name: str) -> None:
@@ -85,8 +97,8 @@ def my_provider_query(user: dict) -> tuple[str, tuple]:
     if user["role"] == ROLE_CEO:
         return "SELECT * FROM providers ORDER BY next_follow_up ASC, id DESC", ()
     return """SELECT * FROM providers
-              WHERE created_by_user_id = ? OR assigned_to_user_id = ?
-              ORDER BY next_follow_up ASC, id DESC""", (user["id"], user["id"])
+              WHERE assigned_to_user_id = ?
+              ORDER BY next_follow_up ASC, id DESC""", (user["id"],)
 
 
 def setup_first_admin() -> None:
@@ -326,7 +338,7 @@ def build_daily_activity_summary(activity_date: date) -> pd.DataFrame:
 
 def my_leads_page(user: dict) -> None:
     st.title("My provider leads")
-    st.caption("Only leads you created or currently own are listed here. Names are taken from your login.")
+    st.caption("Only provider leads currently assigned to you are listed here. Names are taken from your login.")
     query, params = my_provider_query(user)
     providers = frame(query, params)
     with st.expander("Add provider lead", expanded=False):
@@ -340,25 +352,28 @@ def my_leads_page(user: dict) -> None:
             email = b.text_input("Email")
             source = choose_or_specify("Lead source", SOURCES, "new_source")
             a, b, c = st.columns(3)
-            default_stage = "Interested" if user["role"] in {ROLE_ML, ROLE_PGA} else "New Lead"
-            stage = a.selectbox("Current stage", STAGES, index=STAGES.index(default_stage))
+            stage = "Interested"
+            a.text_input("Current stage", value=stage, disabled=True)
             priority = b.selectbox("Priority", PRIORITIES, index=1)
             followup = c.date_input("Next follow-up", value=date.today())
             notes = st.text_area("Remarks")
-            auto_assign_to_rahul = user["role"] in {ROLE_ML, ROLE_PGA}
-            if auto_assign_to_rahul and rahul_owner():
+            rahul = owner_for_role(ROLE_BDM)
+            if rahul:
                 st.caption("This qualified lead will be assigned to Rahul automatically.")
             else:
-                st.caption(f"Owner: {user_label(user)}")
+                st.warning("Rahul's active account is not available yet. The lead will remain with you until it is assigned.")
             if st.form_submit_button("Save provider lead", type="primary"):
                 if not company.strip():
                     st.error("Provider name is required.")
                 else:
-                    owner = rahul_owner() if auto_assign_to_rahul else None
+                    owner = rahul
                     assigned_to, assigned_to_user_id = owner if owner else (user_label(user), user["id"])
                     execute("""INSERT INTO providers (company_name, provider_type, contact_name, phone, email, source, assigned_to, assigned_to_user_id, created_by_user_id, updated_by_user_id, stage, priority, date_added, next_follow_up, remarks, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, user["id"], user["id"], stage, priority, date.today().isoformat(), followup.isoformat(), notes.strip()))
-                    st.success("Provider lead saved.")
+                    if owner:
+                        st.success("Provider lead saved and assigned to Rahul.")
+                    else:
+                        st.success("Provider lead saved. Assign it to Rahul after his account is created.")
                     st.rerun()
     st.subheader("My lead register")
     if providers.empty:
@@ -386,8 +401,14 @@ def my_leads_page(user: dict) -> None:
         followup = c.date_input("Next follow-up", value=pd.to_datetime(record.next_follow_up).date() if pd.notna(record.next_follow_up) else date.today(), key=f"provider_followup_{selected_id}")
         notes = st.text_area("Remarks", value=record.remarks or "", key=f"provider_notes_{selected_id}")
         if st.form_submit_button("Save my changes", type="primary"):
-            execute("""UPDATE providers SET company_name=?, provider_type=?, contact_name=?, phone=?, email=?, source=?, stage=?, priority=?, next_follow_up=?, remarks=?, last_contact=?, updated_by_user_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, stage, priority, followup.isoformat(), notes.strip(), date.today().isoformat(), user["id"], selected_id))
-            st.success("Your provider lead was updated.")
+            next_owner = workflow_owner_for_stage(stage)
+            assigned_to = next_owner[0] if next_owner else record.assigned_to
+            assigned_to_user_id = next_owner[1] if next_owner else record.assigned_to_user_id
+            execute("""UPDATE providers SET company_name=?, provider_type=?, contact_name=?, phone=?, email=?, source=?, assigned_to=?, assigned_to_user_id=?, stage=?, priority=?, next_follow_up=?, remarks=?, last_contact=?, updated_by_user_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, stage, priority, followup.isoformat(), notes.strip(), date.today().isoformat(), user["id"], selected_id))
+            if next_owner:
+                st.success(f"Provider lead updated and assigned to {next_owner[0]}.")
+            else:
+                st.success("Your provider lead was updated.")
             st.rerun()
 
 
@@ -581,7 +602,7 @@ def main_app() -> None:
         elif user["role"] == ROLE_PGA:
             pages = ["Dashboard", "My provider leads"]
         else:
-            pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback", "Handoff reviews"]
+            pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback"]
             if is_management(user):
                 pages.append("Team access")
         page = st.radio("Navigate", pages)
@@ -594,8 +615,6 @@ def main_app() -> None:
         my_activity_page(user)
     elif page == "My provider feedback":
         my_feedback_page(user)
-    elif page == "Handoff reviews":
-        handoffs_page(user)
     elif page == "Team access":
         user_management_page(user)
 
