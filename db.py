@@ -9,7 +9,7 @@ import hashlib
 import hmac
 import os
 import sqlite3
-from datetime import date, timedelta
+import struct
 from pathlib import Path
 
 import pandas as pd
@@ -157,23 +157,38 @@ def initialise() -> None:
             _ensure_column(conn, "providers", column, definition)
         for column, definition in [("submitted_by_user_id", "INTEGER"), ("updated_by_user_id", "INTEGER"), ("updated_at", "TEXT")]:
             _ensure_column(conn, "feedback", column, definition)
-        count = conn.execute("SELECT COUNT(*) FROM providers").fetchone()[0]
-        if count == 0:
-            _seed_demo_data(conn)
+        # Dummy/demo provider rows (CareBridge, Dr. Nikhil Krishnan, WellMove) are
+        # intentionally no longer seeded, and any left over from earlier pilot
+        # runs are cleaned up so they don't linger in the pipeline or reports.
+        conn.execute(
+            """DELETE FROM providers WHERE company_name IN
+            ('CareBridge Home Nursing', 'Dr. Nikhil Krishnan', 'WellMove Physiotherapy')
+            AND assigned_to IN ('Growth Lead', 'Growth Executive 1', 'Growth Executive 2')"""
+        )
+        _repair_corrupted_owner_ids(conn)
 
 
-def _seed_demo_data(conn: sqlite3.Connection) -> None:
-    today = date.today()
-    providers = [
-        ("CareBridge Home Nursing", "Organisation", "Anjali Menon", "9876543210", "anjali@carebridge.in", "Referral", "Growth Lead", "Active Provider", "High", today - timedelta(days=30), today - timedelta(days=2), today + timedelta(days=14), "Completed onboarding."),
-        ("Dr. Nikhil Krishnan", "Doctor", "Dr. Nikhil Krishnan", "9876543211", "nikhil@example.in", "LinkedIn", "Growth Executive 1", "Onboarding", "High", today - timedelta(days=18), today - timedelta(days=1), today + timedelta(days=2), "Credential verification pending."),
-        ("WellMove Physiotherapy", "Organisation", "Fahad Ali", "9876543212", "fahad@wellmove.in", "Meta Ads", "Growth Executive 2", "Interested", "Medium", today - timedelta(days=10), today - timedelta(days=3), today + timedelta(days=1), "Requested a provider-app demo."),
-    ]
-    conn.executemany(
-        """INSERT INTO providers (company_name, provider_type, contact_name, phone, email, source, assigned_to, stage, priority, date_added, last_contact, next_follow_up, remarks)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        [(a, b, c, d, e, f, g, h, i, j.isoformat(), k.isoformat() if k else None, l.isoformat(), m) for a, b, c, d, e, f, g, h, i, j, k, l, m in providers],
-    )
+def _repair_corrupted_owner_ids(conn: sqlite3.Connection) -> None:
+    """One-time repair for a past bug that corrupted ownership.
+
+    A previous version of the workflow logic could pass a pandas numpy
+    integer straight into a SQLite update, which silently stored
+    assigned_to_user_id as an 8-byte BLOB instead of an INTEGER. Once that
+    happened, "WHERE assigned_to_user_id = ?" (used by My provider leads)
+    could no longer match that row, so the provider appeared to vanish from
+    its owner's page. This decodes any such BLOB back into a normal integer
+    so previously affected records become visible again.
+    """
+    rows = conn.execute(
+        "SELECT id, assigned_to_user_id FROM providers WHERE typeof(assigned_to_user_id)='blob'"
+    ).fetchall()
+    for row in rows:
+        blob = row["assigned_to_user_id"]
+        try:
+            fixed_id = struct.unpack("<q", blob)[0]
+        except (struct.error, TypeError):
+            continue
+        conn.execute("UPDATE providers SET assigned_to_user_id=? WHERE id=?", (fixed_id, row["id"]))
 
 
 def frame(query: str, params: tuple = ()) -> pd.DataFrame:
