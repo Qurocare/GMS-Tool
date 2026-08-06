@@ -63,15 +63,25 @@ def owner_for_role(role: str) -> tuple[str, int] | None:
     if users.empty:
         return None
     owner = users.iloc[0]
-    return f"{owner.name}, {owner.role}", int(owner.id)
+    # Use bracket access for the 'name' column: attribute access (owner.name)
+    # collides with pandas' built-in Series.name property (the row's index),
+    # which silently returned a row number instead of the person's name.
+    return f"{owner['name']}, {owner['role']}", int(owner['id'])
 
 
 def workflow_owner_for_stage(stage: str) -> tuple[str, int] | None:
-    """Return the next owner when a provider reaches a handoff stage."""
+    """Return the next owner when a provider reaches a handoff stage.
+
+    Ownership only moves at the two defined handoff points:
+    Rahul (BDM) -> Dr. Asinsha (MO) when Verification is selected, and
+    Dr. Asinsha (MO) -> Reshma (PSM) when Onboarding is selected. Every other
+    stage change, including Active Provider and Lost, keeps the current
+    owner so the provider does not disappear from their Provider Leads page
+    mid-workflow.
+    """
     handoff_roles = {
         "Verification": ROLE_MO,
         "Onboarding": ROLE_PSM,
-        "Active Provider": ROLE_PSM,
     }
     role = handoff_roles.get(stage)
     return owner_for_role(role) if role else None
@@ -106,12 +116,24 @@ def choose_or_specify(label: str, options: list[str], key: str, current: str | N
     return custom.strip() if selection == "Other" and custom.strip() else selection
 
 
-def my_provider_query(user: dict) -> tuple[str, tuple]:
-    if user["role"] == ROLE_CEO:
-        return "SELECT * FROM providers ORDER BY next_follow_up ASC, id DESC", ()
-    return """SELECT * FROM providers
-              WHERE assigned_to_user_id = ?
-              ORDER BY next_follow_up ASC, id DESC""", (user["id"],)
+def my_provider_query(user: dict, include_lost: bool = True) -> tuple[str, tuple]:
+    """Providers currently owned by this user.
+
+    By default this includes Lost providers (used by pages like My provider
+    feedback that may still reference them). The Provider Leads page passes
+    include_lost=False so Lost providers stop appearing there, while they
+    remain visible on the Dashboard and in exported reports, which query the
+    providers table directly.
+    """
+    conditions: list[str] = []
+    params: list = []
+    if user["role"] != ROLE_CEO:
+        conditions.append("assigned_to_user_id = ?")
+        params.append(user["id"])
+    if not include_lost:
+        conditions.append("stage != 'Lost'")
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    return f"SELECT * FROM providers{where} ORDER BY next_follow_up ASC, id DESC", tuple(params)
 
 
 def setup_first_admin() -> None:
@@ -363,8 +385,8 @@ def build_daily_activity_summary(activity_date: date, active_providers: int, dap
 
 def my_leads_page(user: dict) -> None:
     st.title("My provider leads")
-    st.caption("Only provider leads currently assigned to you are listed here. Names are taken from your login.")
-    query, params = my_provider_query(user)
+    st.caption("Active provider leads currently assigned to you are listed here. Lost leads stay with you internally but are hidden from this list; they remain visible on the Dashboard and in reports.")
+    query, params = my_provider_query(user, include_lost=False)
     providers = frame(query, params)
     with st.expander("Add provider lead", expanded=False):
         with st.form("new_provider", clear_on_submit=True):
@@ -396,9 +418,9 @@ def my_leads_page(user: dict) -> None:
                     execute("""INSERT INTO providers (company_name, provider_type, contact_name, phone, email, source, assigned_to, assigned_to_user_id, created_by_user_id, updated_by_user_id, stage, priority, date_added, next_follow_up, remarks, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, user["id"], user["id"], stage, priority, date.today().isoformat(), followup.isoformat(), notes.strip()))
                     if owner:
-                        st.success("Provider lead saved and assigned to Rahul.")
+                        st.success(f"Provider lead saved. Stage set to {stage}. Assigned to Rahul.")
                     else:
-                        st.success("Provider lead saved. Assign it to Rahul after his account is created.")
+                        st.success(f"Provider lead saved. Stage set to {stage}. Assign it to Rahul after his account is created.")
                     st.rerun()
     st.subheader("My lead register")
     if providers.empty:
@@ -427,15 +449,44 @@ def my_leads_page(user: dict) -> None:
         followup = c.date_input("Next follow-up", value=pd.to_datetime(record.next_follow_up).date() if pd.notna(record.next_follow_up) else date.today(), key=f"provider_followup_{selected_id}")
         notes = st.text_area("Remarks", value=record.remarks or "", key=f"provider_notes_{selected_id}")
         if st.form_submit_button("Save my changes", type="primary"):
+            # Ownership only moves automatically at the Verification and
+            # Onboarding handoff points (see workflow_owner_for_stage). Every
+            # other stage change, including Lost and Active Provider, keeps
+            # the provider with its current owner.
             next_owner = workflow_owner_for_stage(stage)
             assigned_to = next_owner[0] if next_owner else record.assigned_to
-            assigned_to_user_id = next_owner[1] if next_owner else record.assigned_to_user_id
+            # Cast to a native Python int: pandas returns numpy.int64 here,
+            # and passing that straight to sqlite3 silently stores it as a
+            # BLOB instead of an INTEGER. Once corrupted, the "WHERE
+            # assigned_to_user_id = ?" filter used by My provider leads never
+            # matches that row again, so the provider vanishes from the
+            # owner's list on the very next edit. This was the root cause of
+            # providers disappearing before their workflow was finished.
+            assigned_to_user_id = next_owner[1] if next_owner else int(record.assigned_to_user_id)
             execute("""UPDATE providers SET company_name=?, provider_type=?, contact_name=?, phone=?, email=?, source=?, assigned_to=?, assigned_to_user_id=?, stage=?, priority=?, next_follow_up=?, remarks=?, last_contact=?, updated_by_user_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, stage, priority, followup.isoformat(), notes.strip(), date.today().isoformat(), user["id"], selected_id))
-            if next_owner:
-                st.success(f"Provider lead updated and assigned to {next_owner[0]}.")
+            if stage != record.stage:
+                if next_owner:
+                    new_owner_name = next_owner[0].split(",")[0].strip()
+                    st.success(f"Stage updated to {stage}. Assigned to {new_owner_name}.")
+                elif stage == "Lost":
+                    st.success("Stage updated to Lost. This lead is now hidden from My provider leads, but stays visible on the Dashboard and in reports.")
+                else:
+                    st.success(f"Stage updated to {stage}.")
             else:
-                st.success("Your provider lead was updated.")
+                st.success("Provider lead updated.")
             st.rerun()
+
+    st.divider()
+    st.subheader("Delete provider")
+    st.caption("This permanently removes the provider record from the database. This cannot be undone.")
+    confirm_delete = st.checkbox(
+        f"I confirm I want to permanently delete '{record.company_name}' (#{selected_id}).",
+        key=f"confirm_delete_{selected_id}",
+    )
+    if st.button("Delete provider", type="secondary", disabled=not confirm_delete, key=f"delete_provider_{selected_id}"):
+        execute("DELETE FROM providers WHERE id=?", (selected_id,))
+        st.success(f"Provider '{record.company_name}' was permanently deleted.")
+        st.rerun()
 
 
 def my_activity_page(user: dict) -> None:
