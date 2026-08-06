@@ -24,7 +24,7 @@ ACTIVITY_FIELDS = {
     ],
     ROLE_BDM: [
         ("qualified_leads_contacted", "Qualified leads contacted"),
-        ("demos_scheduled", "Demos scheduled"),
+        ("demos_completed", "Demos completed successfully"),
         ("followups_completed", "Follow-ups completed"),
     ],
     ROLE_PSM: [
@@ -69,13 +69,26 @@ def owner_for_role(role: str) -> tuple[str, int] | None:
 def workflow_owner_for_stage(stage: str) -> tuple[str, int] | None:
     """Return the next owner when a provider reaches a handoff stage."""
     handoff_roles = {
-        "Demo Scheduled": ROLE_PSM,
         "Verification": ROLE_MO,
         "Onboarding": ROLE_PSM,
         "Active Provider": ROLE_PSM,
     }
     role = handoff_roles.get(stage)
     return owner_for_role(role) if role else None
+
+
+def allowed_stages_for_role(user: dict, current_stage: str) -> list[str]:
+    """Limit workflow changes to the stages owned by the signed-in role."""
+    allowed_by_role = {
+        ROLE_BDM: ["Interested", "Contacted", "Meeting Scheduled", "Demo Scheduled", "Demo Completed", "Verification", "Lost"],
+        ROLE_MO: ["Verification", "Agreement Sent", "Onboarding", "Lost"],
+        ROLE_PSM: ["Onboarding", "Active Provider", "Lost"],
+        ROLE_CEO: STAGES,
+    }
+    allowed = allowed_by_role.get(user["role"], [current_stage])
+    # Keep legacy records editable by their current owner while preserving the
+    # normal options for all new workflow records.
+    return list(dict.fromkeys([current_stage, *allowed]))
 
 
 def export_button(data: pd.DataFrame, name: str) -> None:
@@ -204,7 +217,7 @@ def dashboard_page(user: dict) -> None:
     with col_b:
         with st.container(border=True):
             st.subheader("Team scorecards")
-            scorecards = build_scorecards(start_date, end_date)
+            scorecards = build_scorecards(start_date, end_date, active, dap_today)
             st.dataframe(scorecards, hide_index=True, width="stretch")
 
     with st.container(border=True):
@@ -218,6 +231,20 @@ def dashboard_page(user: dict) -> None:
             st.info("No provider records yet.")
 
     with st.container(border=True):
+        st.subheader("Shared provider register")
+        st.caption("Read-only provider pipeline for the full Growth team. Download it when you need a working copy.")
+        register = providers[[
+            "id", "company_name", "provider_type", "contact_name", "phone", "email",
+            "source", "assigned_to", "stage", "priority", "date_added", "next_follow_up", "remarks",
+        ]].copy()
+        register.columns = [
+            "ID", "Provider", "Type", "Contact", "Phone", "Email", "Source",
+            "Current owner", "Current stage", "Priority", "Date added", "Next follow-up", "Remarks",
+        ]
+        export_button(register, "qurocare-shared-provider-register")
+        st.dataframe(register, hide_index=True, width="stretch")
+
+    with st.container(border=True):
         st.subheader("Daily activity calendar")
         selected_day = st.date_input(
             "Select a day to review team activity",
@@ -226,7 +253,7 @@ def dashboard_page(user: dict) -> None:
             key="daily_activity_date",
         )
         st.caption("This shows whether each scored team member submitted activity on the selected date, with that day’s outcome measure.")
-        daily_activity = build_daily_activity_summary(selected_day)
+        daily_activity = build_daily_activity_summary(selected_day, active, dap_today)
         st.dataframe(daily_activity, hide_index=True, width="stretch")
 
 
@@ -241,7 +268,7 @@ def activity_metrics_for_user(activities: pd.DataFrame, user_id: int) -> tuple[d
     return metrics, not entries.empty
 
 
-def scorecard_measure(role: str, metrics: dict) -> tuple[str, str] | None:
+def scorecard_measure(role: str, metrics: dict, active_providers: int = 0, dap_today: int = 0) -> tuple[str, str] | None:
     """Return the outcome measure and supporting evidence for a role."""
     if role == ROLE_ML:
         conversations = metrics.get("meaningful_conversations", 0)
@@ -252,10 +279,10 @@ def scorecard_measure(role: str, metrics: dict) -> tuple[str, str] | None:
         )
     if role == ROLE_BDM:
         contacted = metrics.get("qualified_leads_contacted", 0)
-        demos = metrics.get("demos_scheduled", 0)
+        demos = metrics.get("demos_completed", 0)
         return (
-            f"{(demos / contacted * 100) if contacted else 0:.0f}% demo scheduling rate",
-            f"{demos} demos from {contacted} qualified leads contacted",
+            f"{(demos / contacted * 100) if contacted else 0:.0f}% conversion rate",
+            f"{demos} successful demos from {contacted} qualified leads contacted",
         )
     if role == ROLE_MO:
         received = metrics.get("providers_received_for_verification", 0)
@@ -266,18 +293,16 @@ def scorecard_measure(role: str, metrics: dict) -> tuple[str, str] | None:
             f"{ready} ready to activate after {verified} verifications",
         )
     if role == ROLE_PSM:
-        demos = metrics.get("demos_conducted", 0)
-        ready = metrics.get("providers_ready_for_onboarding", 0)
         return (
-            f"{(ready / demos * 100) if demos else 0:.0f}% onboarding-ready rate",
-            f"{ready} onboarding-ready from {demos} demos",
+            f"{(dap_today / active_providers * 100) if active_providers else 0:.0f}% DAP coverage",
+            f"{dap_today} DAP from {active_providers} active providers",
         )
     if role == ROLE_CEO:
         return "Management review", "CEO/Admin view"
     return None
 
 
-def build_scorecards(start_date: date, end_date: date) -> pd.DataFrame:
+def build_scorecards(start_date: date, end_date: date, active_providers: int, dap_today: int) -> pd.DataFrame:
     users = users_frame()
     # Deactivated accounts remain in the audit trail but are not operational
     # team members and should not appear on the shared scorecard.
@@ -300,7 +325,7 @@ def build_scorecards(start_date: date, end_date: date) -> pd.DataFrame:
     rows = []
     for user in users.itertuples():
         metrics, _ = activity_metrics_for_user(activities, user.id)
-        result = scorecard_measure(user.role, metrics)
+        result = scorecard_measure(user.role, metrics, active_providers, dap_today)
         if result is None:
             continue
         measure, evidence = result
@@ -308,7 +333,7 @@ def build_scorecards(start_date: date, end_date: date) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_daily_activity_summary(activity_date: date) -> pd.DataFrame:
+def build_daily_activity_summary(activity_date: date, active_providers: int, dap_today: int) -> pd.DataFrame:
     """Build a shared, read-only daily review for the operational team."""
     users = users_frame()
     users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY)]
@@ -321,7 +346,7 @@ def build_daily_activity_summary(activity_date: date) -> pd.DataFrame:
     rows = []
     for user in users.itertuples():
         metrics, submitted = activity_metrics_for_user(activities, user.id)
-        result = scorecard_measure(user.role, metrics)
+        result = scorecard_measure(user.role, metrics, active_providers, dap_today)
         if result is None or user.role == ROLE_CEO:
             continue
         measure, evidence = result
@@ -396,7 +421,8 @@ def my_leads_page(user: dict) -> None:
         email = b.text_input("Email", value=record.email or "", key=f"provider_email_{selected_id}")
         source = choose_or_specify("Lead source", SOURCES, f"provider_source_{selected_id}", record.source)
         a, b, c = st.columns(3)
-        stage = a.selectbox("Stage", STAGES, index=STAGES.index(record.stage), key=f"provider_stage_{selected_id}")
+        stage_options = allowed_stages_for_role(user, record.stage)
+        stage = a.selectbox("Stage", stage_options, index=stage_options.index(record.stage), key=f"provider_stage_{selected_id}")
         priority = b.selectbox("Priority", PRIORITIES, index=PRIORITIES.index(record.priority), key=f"provider_priority_{selected_id}")
         followup = c.date_input("Next follow-up", value=pd.to_datetime(record.next_follow_up).date() if pd.notna(record.next_follow_up) else date.today(), key=f"provider_followup_{selected_id}")
         notes = st.text_area("Remarks", value=record.remarks or "", key=f"provider_notes_{selected_id}")
