@@ -1,3 +1,7 @@
 [runner]
 # Prevent Streamlit from auto-rendering bare Python expressions.
 magicEnabled = false
+
+[server]
+enableCORS = false
+enableXsrfProtection = false
