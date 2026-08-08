@@ -21,6 +21,9 @@ ACTIVITY_FIELDS = {
         ("providers_researched", "Providers researched"),
         ("meaningful_conversations", "Meaningful provider conversations (M)"),
         ("leads_qualified", "Qualified interested leads added to GMS (QIL)"),
+        ("demos_supported", "Demos supported"),
+        ("lost_cases_handled", "Lost cases handled (re-engagement calls)"),
+        ("followups_completed", "Follow-ups completed"),
     ],
     ROLE_BDM: [
         ("qualified_leads_contacted", "Qualified leads contacted (QLC)"),
@@ -29,18 +32,18 @@ ACTIVITY_FIELDS = {
         ("followups_completed", "Follow-ups completed"),
     ],
     ROLE_PSM: [
-        ("demo_ready_providers_contacted", "Demo-ready providers contacted"),
         ("demos_conducted", "Demos conducted"),
-        ("providers_ready_for_onboarding", "Providers ready for onboarding"),
+        ("providers_ready_for_onboarding", "Verified providers ready for onboarding (V)"),
+        ("providers_ready_to_activate", "Providers ready to activate (AP)"),
         ("feedback_logged", "Provider feedback logged"),
         ("tech_followups", "Tech follow-ups"),
     ],
     ROLE_MO: [
         ("demos_supported", "Demos supported"),
-        ("providers_received_for_verification", "Providers received for verification"),
+        ("converted_leads_received", "Converted leads received for verification (C)"),
         ("documents_reviewed", "Documents reviewed"),
         ("verifications_completed", "Verifications completed (V)"),
-        ("providers_ready_to_activate", "Providers ready to activate (AP)"),
+        ("followups_completed", "Follow-ups completed"),
     ],
     ROLE_PGA: [],
     ROLE_CEO: [],
@@ -251,7 +254,7 @@ def dashboard_page(user: dict) -> None:
     with col_b:
         with st.container(border=True):
             st.subheader("Team scorecards")
-            scorecards = build_scorecards(start_date, end_date)
+            scorecards = build_scorecards(start_date, end_date, dap_today)
             st.dataframe(scorecards, hide_index=True, width="stretch")
 
     with st.container(border=True):
@@ -287,7 +290,7 @@ def dashboard_page(user: dict) -> None:
             key="daily_activity_date",
         )
         st.caption("This shows whether each scored team member submitted activity on the selected date, with that day’s outcome measure.")
-        daily_activity = build_daily_activity_summary(selected_day)
+        daily_activity = build_daily_activity_summary(selected_day, dap_today)
         st.dataframe(daily_activity, hide_index=True, width="stretch")
 
 
@@ -302,28 +305,14 @@ def activity_metrics_for_user(activities: pd.DataFrame, user_id: int) -> tuple[d
     return metrics, not entries.empty
 
 
-def aggregate_metrics_for_role(activities: pd.DataFrame, role: str) -> dict:
-    """Sum activity values across every active user of one role for a period.
+def scorecard_measures(role: str, metrics: dict, dap_today: int) -> list[tuple[str, str, str]]:
+    """Return a list of (metric name, measure, evidence) tuples for a role.
 
-    Some scorecard formulas intentionally divide by another role's team-wide
-    number for the same period (e.g. Dr. Asinsha's Verification completion
-    rate is measured against Rahul's team-wide Converted leads, not her own
-    submitted numbers). This aggregates a role's activity the same way
-    activity_metrics_for_user does for a single person.
-    """
-    metrics: dict[str, int] = {}
-    if activities.empty:
-        return metrics
-    entries = activities[activities.role == role]
-    for value in entries.metrics_json:
-        metrics.update({key: metrics.get(key, 0) + int(number) for key, number in json.loads(value).items()})
-    return metrics
+    Every formula below uses only that same person's own submitted activity
+    fields (each role logs both the numerator and denominator it needs), so
+    the numbers are self-contained per person. Formula definitions, as
+    agreed with the CEO:
 
-
-def scorecard_measure(role: str, metrics: dict, team_totals: dict[str, dict]) -> tuple[str, str] | None:
-    """Return the outcome measure and supporting evidence for a role.
-
-    Formula definitions, as agreed with the CEO:
     - Halifa (Market Lead) - Quality lead rate = QIL / M x 100
         QIL = Qualified interested leads added to GMS (her own activity)
         M   = Meaningful provider conversations (her own activity)
@@ -332,49 +321,66 @@ def scorecard_measure(role: str, metrics: dict, team_totals: dict[str, dict]) ->
         QLC = Qualified leads contacted (his own activity)
     - Dr. Asinsha (MO) - Verification completion rate = V / C x 100
         V = Verifications completed (her own activity)
-        C = Converted leads, team-wide for the same period (Rahul's C, above)
+        C = Converted leads received for verification (her own activity)
     - Reshma (PSM) - Activation-ready rate = AP / V x 100
-        AP = Providers ready to activate, team-wide for the same period (Dr. Asinsha's AP)
-        V  = Verifications completed, team-wide for the same period (Dr. Asinsha's V, above)
+        AP = Providers ready to activate (her own activity)
+        V  = Verified providers ready for onboarding (her own activity)
+      Reshma also gets a second measure, DAP coverage = DAP / AP x 100
+        DAP = Daily active providers (dashboard placeholder, currently 0
+              until Tech connects the provider-app data source)
+        AP  = Providers ready to activate (her own activity, same as above)
     """
     if role == ROLE_ML:
         conversations = metrics.get("meaningful_conversations", 0)
         qualified = metrics.get("leads_qualified", 0)
         rate = (qualified / conversations * 100) if conversations else 0
-        return (
-            f"{rate:.0f}% quality lead rate",
+        return [(
+            "Quality lead rate",
+            f"{rate:.0f}%",
             f"{qualified} qualified leads (QIL) from {conversations} meaningful conversations (M)",
-        )
+        )]
     if role == ROLE_BDM:
         contacted = metrics.get("qualified_leads_contacted", 0)
         converted = metrics.get("converted_leads", 0)
         rate = (converted / contacted * 100) if contacted else 0
-        return (
-            f"{rate:.0f}% conversion rate",
+        return [(
+            "Conversion rate",
+            f"{rate:.0f}%",
             f"{converted} converted leads (C) from {contacted} qualified leads contacted (QLC)",
-        )
+        )]
     if role == ROLE_MO:
         verified = metrics.get("verifications_completed", 0)
-        team_converted = team_totals.get(ROLE_BDM, {}).get("converted_leads", 0)
-        rate = (verified / team_converted * 100) if team_converted else 0
-        return (
-            f"{rate:.0f}% verification completion rate",
-            f"{verified} verifications completed (V) from {team_converted} converted leads (C), team-wide",
-        )
+        received = metrics.get("converted_leads_received", 0)
+        rate = (verified / received * 100) if received else 0
+        return [(
+            "Verification completion rate",
+            f"{rate:.0f}%",
+            f"{verified} verifications completed (V) from {received} converted leads received for verification (C)",
+        )]
     if role == ROLE_PSM:
-        team_ready = team_totals.get(ROLE_MO, {}).get("providers_ready_to_activate", 0)
-        team_verified = team_totals.get(ROLE_MO, {}).get("verifications_completed", 0)
-        rate = (team_ready / team_verified * 100) if team_verified else 0
-        return (
-            f"{rate:.0f}% activation-ready rate",
-            f"{team_ready} providers ready to activate (AP) from {team_verified} verifications completed (V), team-wide",
-        )
+        ap = metrics.get("providers_ready_to_activate", 0)
+        v = metrics.get("providers_ready_for_onboarding", 0)
+        activation_rate = (ap / v * 100) if v else 0
+        dap_rate = (dap_today / ap * 100) if ap else 0
+        dap_note = " (DAP is a placeholder until Tech connects the provider-app data source)" if dap_today == 0 else ""
+        return [
+            (
+                "Activation-ready rate",
+                f"{activation_rate:.0f}%",
+                f"{ap} providers ready to activate (AP) from {v} verified providers ready for onboarding (V)",
+            ),
+            (
+                "DAP coverage",
+                f"{dap_rate:.0f}%",
+                f"{dap_today} daily active providers (DAP) from {ap} providers ready to activate (AP){dap_note}",
+            ),
+        ]
     if role == ROLE_CEO:
-        return "Management review", "CEO/Admin view"
-    return None
+        return [("Management review", "-", "CEO/Admin view")]
+    return []
 
 
-def build_scorecards(start_date: date, end_date: date) -> pd.DataFrame:
+def build_scorecards(start_date: date, end_date: date, dap_today: int) -> pd.DataFrame:
     users = users_frame()
     # Deactivated accounts remain in the audit trail but are not operational
     # team members and should not appear on the shared scorecard.
@@ -389,51 +395,42 @@ def build_scorecards(start_date: date, end_date: date) -> pd.DataFrame:
     users = users.assign(_scorecard_order=users.role.map(role_order).fillna(99))
     users = users.sort_values(["_scorecard_order", "id"])
     activities = frame(
-        """SELECT ra.*, u.name, u.role FROM role_activities ra
-           JOIN users u ON u.id = ra.user_id
-           WHERE ra.activity_date BETWEEN ? AND ?""",
+        "SELECT * FROM role_activities WHERE activity_date BETWEEN ? AND ?",
         (start_date.isoformat(), end_date.isoformat()),
     )
-    team_totals = {role: aggregate_metrics_for_role(activities, role) for role in (ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM)}
     rows = []
     for user in users.itertuples():
         metrics, _ = activity_metrics_for_user(activities, user.id)
-        result = scorecard_measure(user.role, metrics, team_totals)
-        if result is None:
-            continue
-        measure, evidence = result
-        rows.append({"Team member": f"{user.name}, {user.role}", "Main measure": measure, "Evidence": evidence})
+        for metric_name, measure, evidence in scorecard_measures(user.role, metrics, dap_today):
+            rows.append({"Team member": f"{user.name}, {user.role}", "Metric": metric_name, "Value": measure, "Evidence": evidence})
     return pd.DataFrame(rows)
 
 
-def build_daily_activity_summary(activity_date: date) -> pd.DataFrame:
+def build_daily_activity_summary(activity_date: date, dap_today: int) -> pd.DataFrame:
     """Build a shared, read-only daily review for the operational team."""
     users = users_frame()
     users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY)]
     role_order = {ROLE_ML: 0, ROLE_BDM: 1, ROLE_MO: 2, ROLE_PSM: 3, ROLE_CEO: 4}
     users = users.assign(_daily_order=users.role.map(role_order).fillna(99)).sort_values(["_daily_order", "id"])
     activities = frame(
-        """SELECT ra.*, u.name, u.role FROM role_activities ra
-           JOIN users u ON u.id = ra.user_id
-           WHERE ra.activity_date=?""",
+        "SELECT * FROM role_activities WHERE activity_date=?",
         (activity_date.isoformat(),),
     )
-    team_totals = {role: aggregate_metrics_for_role(activities, role) for role in (ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM)}
     rows = []
     for user in users.itertuples():
         metrics, submitted = activity_metrics_for_user(activities, user.id)
-        result = scorecard_measure(user.role, metrics, team_totals)
-        if result is None or user.role == ROLE_CEO:
+        if user.role == ROLE_CEO:
             continue
-        measure, evidence = result
-        rows.append(
-            {
-                "Team member": f"{user.name}, {user.role}",
-                "Activity submitted": "Yes" if submitted else "No",
-                "Daily measure": measure,
-                "Evidence": evidence,
-            }
-        )
+        for metric_name, measure, evidence in scorecard_measures(user.role, metrics, dap_today):
+            rows.append(
+                {
+                    "Team member": f"{user.name}, {user.role}",
+                    "Activity submitted": "Yes" if submitted else "No",
+                    "Metric": metric_name,
+                    "Daily measure": measure,
+                    "Evidence": evidence,
+                }
+            )
     return pd.DataFrame(rows)
 
 
