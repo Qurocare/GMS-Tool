@@ -210,7 +210,7 @@ def user_count() -> int:
 def create_user(name: str, role: str, email: str, password: str) -> None:
     with connect() as conn:
         conn.execute("INSERT INTO users (name, role, email, password_hash) VALUES (?, ?, ?, ?)", (name, role, email.strip().lower(), hash_password(password)))
-        conn.commit()
+        conn.commit() 
 
 
 def authenticate(email: str, password: str) -> dict | None:
