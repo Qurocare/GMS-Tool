@@ -19,12 +19,13 @@ st.session_state.setdefault("gms_user", None)
 ACTIVITY_FIELDS = {
     ROLE_ML: [
         ("providers_researched", "Providers researched"),
-        ("meaningful_conversations", "Meaningful provider conversations"),
-        ("leads_qualified", "Qualified interested leads added to GMS"),
+        ("meaningful_conversations", "Meaningful provider conversations (M)"),
+        ("leads_qualified", "Qualified interested leads added to GMS (QIL)"),
     ],
     ROLE_BDM: [
-        ("qualified_leads_contacted", "Qualified leads contacted"),
-        ("demos_completed", "Demos completed successfully"),
+        ("qualified_leads_contacted", "Qualified leads contacted (QLC)"),
+        ("demos_completed", "Demos completed (does not by itself mean converted)"),
+        ("converted_leads", "Converted leads - moved to Converted stage (C)"),
         ("followups_completed", "Follow-ups completed"),
     ],
     ROLE_PSM: [
@@ -38,8 +39,8 @@ ACTIVITY_FIELDS = {
         ("demos_supported", "Demos supported"),
         ("providers_received_for_verification", "Providers received for verification"),
         ("documents_reviewed", "Documents reviewed"),
-        ("verifications_completed", "Verifications completed"),
-        ("providers_ready_to_activate", "Providers ready to activate"),
+        ("verifications_completed", "Verifications completed (V)"),
+        ("providers_ready_to_activate", "Providers ready to activate (AP)"),
     ],
     ROLE_PGA: [],
     ROLE_CEO: [],
@@ -72,16 +73,24 @@ def owner_for_role(role: str) -> tuple[str, int] | None:
 def workflow_owner_for_stage(stage: str) -> tuple[str, int] | None:
     """Return the next owner when a provider reaches a handoff stage.
 
-    Ownership only moves at the two defined handoff points:
-    Rahul (BDM) -> Dr. Asinsha (MO) when Verification is selected, and
-    Dr. Asinsha (MO) -> Reshma (PSM) when Onboarding is selected. Every other
-    stage change, including Active Provider and Lost, keeps the current
-    owner so the provider does not disappear from their Provider Leads page
-    mid-workflow.
+    Ownership moves automatically at four defined handoff points:
+    - Rahul (BDM) -> Dr. Asinsha (MO) when Converted is selected (a lead can
+      complete a demo without being converted, so the BDM->MO hand-off now
+      happens at Converted, not at Demo Completed or Verification).
+    - Dr. Asinsha (MO) -> Reshma (PSM) when Onboarding is selected.
+    - Anyone -> Halifa (Market Lead) when Lost is selected, so she can
+      re-engage the lead rather than it sitting orphaned with whoever last
+      touched it.
+    - Halifa (Market Lead) -> Rahul (BDM) when Interested is selected, so a
+      lead she re-engages routes straight back into Rahul's pipeline.
+    Every other stage change keeps the current owner so the provider does
+    not disappear from their Provider Leads page mid-workflow.
     """
     handoff_roles = {
-        "Verification": ROLE_MO,
+        "Converted": ROLE_MO,
         "Onboarding": ROLE_PSM,
+        "Lost": ROLE_ML,
+        "Interested": ROLE_BDM,
     }
     role = handoff_roles.get(stage)
     return owner_for_role(role) if role else None
@@ -90,9 +99,10 @@ def workflow_owner_for_stage(stage: str) -> tuple[str, int] | None:
 def allowed_stages_for_role(user: dict, current_stage: str) -> list[str]:
     """Limit workflow changes to the stages owned by the signed-in role."""
     allowed_by_role = {
-        ROLE_BDM: ["Interested", "Contacted", "Meeting Scheduled", "Demo Scheduled", "Demo Completed", "Verification", "Lost"],
-        ROLE_MO: ["Verification", "Agreement Sent", "Onboarding", "Lost"],
+        ROLE_BDM: ["Interested", "Contacted", "Meeting Scheduled", "Demo Scheduled", "Demo Completed", "Converted", "Lost"],
+        ROLE_MO: ["Converted", "Verification", "Agreement Sent", "Onboarding", "Lost"],
         ROLE_PSM: ["Onboarding", "Active Provider", "Lost"],
+        ROLE_ML: ["Lost", "Interested"],
         ROLE_CEO: STAGES,
     }
     allowed = allowed_by_role.get(user["role"], [current_stage])
@@ -187,13 +197,15 @@ def dashboard_page(user: dict) -> None:
     total = len(providers)
     active = int((providers.stage == "Active Provider").sum()) if total else 0
     demos = int(providers.stage.isin(["Demo Scheduled", "Demo Completed"]).sum()) if total else 0
+    converted = int((providers.stage == "Converted").sum()) if total else 0
     onboarding = int((providers.stage == "Onboarding").sum()) if total else 0
     conversion = active / total * 100 if total else 0
     due_dates = pd.to_datetime(providers.get("next_follow_up"), errors="coerce") if total else pd.Series(dtype="datetime64[ns]")
     due = int((due_dates.dt.date <= date.today()).sum()) if not due_dates.empty else 0
     with st.container(horizontal=True):
         st.metric("Total leads", total, border=True)
-        st.metric("Demos", demos, border=True)
+        st.metric("Demos", demos, border=True, help="Demo Scheduled + Demo Completed. A completed demo does not by itself mean the lead converted.")
+        st.metric("Converted", converted, border=True, help="Leads Rahul has moved to Converted, now with Dr. Asinsha awaiting Verification.")
         st.metric("Onboarding", onboarding, border=True)
         st.metric("Active providers", active, border=True)
         st.metric("Daily active providers (DAP)", dap_today, border=True,
@@ -239,7 +251,7 @@ def dashboard_page(user: dict) -> None:
     with col_b:
         with st.container(border=True):
             st.subheader("Team scorecards")
-            scorecards = build_scorecards(start_date, end_date, active, dap_today)
+            scorecards = build_scorecards(start_date, end_date)
             st.dataframe(scorecards, hide_index=True, width="stretch")
 
     with st.container(border=True):
@@ -275,7 +287,7 @@ def dashboard_page(user: dict) -> None:
             key="daily_activity_date",
         )
         st.caption("This shows whether each scored team member submitted activity on the selected date, with that day’s outcome measure.")
-        daily_activity = build_daily_activity_summary(selected_day, active, dap_today)
+        daily_activity = build_daily_activity_summary(selected_day)
         st.dataframe(daily_activity, hide_index=True, width="stretch")
 
 
@@ -290,41 +302,79 @@ def activity_metrics_for_user(activities: pd.DataFrame, user_id: int) -> tuple[d
     return metrics, not entries.empty
 
 
-def scorecard_measure(role: str, metrics: dict, active_providers: int = 0, dap_today: int = 0) -> tuple[str, str] | None:
-    """Return the outcome measure and supporting evidence for a role."""
+def aggregate_metrics_for_role(activities: pd.DataFrame, role: str) -> dict:
+    """Sum activity values across every active user of one role for a period.
+
+    Some scorecard formulas intentionally divide by another role's team-wide
+    number for the same period (e.g. Dr. Asinsha's Verification completion
+    rate is measured against Rahul's team-wide Converted leads, not her own
+    submitted numbers). This aggregates a role's activity the same way
+    activity_metrics_for_user does for a single person.
+    """
+    metrics: dict[str, int] = {}
+    if activities.empty:
+        return metrics
+    entries = activities[activities.role == role]
+    for value in entries.metrics_json:
+        metrics.update({key: metrics.get(key, 0) + int(number) for key, number in json.loads(value).items()})
+    return metrics
+
+
+def scorecard_measure(role: str, metrics: dict, team_totals: dict[str, dict]) -> tuple[str, str] | None:
+    """Return the outcome measure and supporting evidence for a role.
+
+    Formula definitions, as agreed with the CEO:
+    - Halifa (Market Lead) - Quality lead rate = QIL / M x 100
+        QIL = Qualified interested leads added to GMS (her own activity)
+        M   = Meaningful provider conversations (her own activity)
+    - Rahul (BDM) - Conversion rate = C / QLC x 100
+        C   = Converted leads, i.e. leads moved to the Converted stage (his own activity)
+        QLC = Qualified leads contacted (his own activity)
+    - Dr. Asinsha (MO) - Verification completion rate = V / C x 100
+        V = Verifications completed (her own activity)
+        C = Converted leads, team-wide for the same period (Rahul's C, above)
+    - Reshma (PSM) - Activation-ready rate = AP / V x 100
+        AP = Providers ready to activate, team-wide for the same period (Dr. Asinsha's AP)
+        V  = Verifications completed, team-wide for the same period (Dr. Asinsha's V, above)
+    """
     if role == ROLE_ML:
         conversations = metrics.get("meaningful_conversations", 0)
         qualified = metrics.get("leads_qualified", 0)
+        rate = (qualified / conversations * 100) if conversations else 0
         return (
-            f"{(qualified / conversations * 100) if conversations else 0:.0f}% quality lead rate",
-            f"{qualified} qualified leads from {conversations} conversations",
+            f"{rate:.0f}% quality lead rate",
+            f"{qualified} qualified leads (QIL) from {conversations} meaningful conversations (M)",
         )
     if role == ROLE_BDM:
         contacted = metrics.get("qualified_leads_contacted", 0)
-        demos = metrics.get("demos_completed", 0)
+        converted = metrics.get("converted_leads", 0)
+        rate = (converted / contacted * 100) if contacted else 0
         return (
-            f"{(demos / contacted * 100) if contacted else 0:.0f}% conversion rate",
-            f"{demos} successful demos from {contacted} qualified leads contacted",
+            f"{rate:.0f}% conversion rate",
+            f"{converted} converted leads (C) from {contacted} qualified leads contacted (QLC)",
         )
     if role == ROLE_MO:
-        received = metrics.get("providers_received_for_verification", 0)
         verified = metrics.get("verifications_completed", 0)
-        ready = metrics.get("providers_ready_to_activate", 0)
+        team_converted = team_totals.get(ROLE_BDM, {}).get("converted_leads", 0)
+        rate = (verified / team_converted * 100) if team_converted else 0
         return (
-            f"{(verified / received * 100) if received else 0:.0f}% verification completion",
-            f"{ready} ready to activate after {verified} verifications",
+            f"{rate:.0f}% verification completion rate",
+            f"{verified} verifications completed (V) from {team_converted} converted leads (C), team-wide",
         )
     if role == ROLE_PSM:
+        team_ready = team_totals.get(ROLE_MO, {}).get("providers_ready_to_activate", 0)
+        team_verified = team_totals.get(ROLE_MO, {}).get("verifications_completed", 0)
+        rate = (team_ready / team_verified * 100) if team_verified else 0
         return (
-            f"{(dap_today / active_providers * 100) if active_providers else 0:.0f}% DAP coverage",
-            f"{dap_today} DAP from {active_providers} active providers",
+            f"{rate:.0f}% activation-ready rate",
+            f"{team_ready} providers ready to activate (AP) from {team_verified} verifications completed (V), team-wide",
         )
     if role == ROLE_CEO:
         return "Management review", "CEO/Admin view"
     return None
 
 
-def build_scorecards(start_date: date, end_date: date, active_providers: int, dap_today: int) -> pd.DataFrame:
+def build_scorecards(start_date: date, end_date: date) -> pd.DataFrame:
     users = users_frame()
     # Deactivated accounts remain in the audit trail but are not operational
     # team members and should not appear on the shared scorecard.
@@ -344,10 +394,11 @@ def build_scorecards(start_date: date, end_date: date, active_providers: int, da
            WHERE ra.activity_date BETWEEN ? AND ?""",
         (start_date.isoformat(), end_date.isoformat()),
     )
+    team_totals = {role: aggregate_metrics_for_role(activities, role) for role in (ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM)}
     rows = []
     for user in users.itertuples():
         metrics, _ = activity_metrics_for_user(activities, user.id)
-        result = scorecard_measure(user.role, metrics, active_providers, dap_today)
+        result = scorecard_measure(user.role, metrics, team_totals)
         if result is None:
             continue
         measure, evidence = result
@@ -355,20 +406,23 @@ def build_scorecards(start_date: date, end_date: date, active_providers: int, da
     return pd.DataFrame(rows)
 
 
-def build_daily_activity_summary(activity_date: date, active_providers: int, dap_today: int) -> pd.DataFrame:
+def build_daily_activity_summary(activity_date: date) -> pd.DataFrame:
     """Build a shared, read-only daily review for the operational team."""
     users = users_frame()
     users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY)]
     role_order = {ROLE_ML: 0, ROLE_BDM: 1, ROLE_MO: 2, ROLE_PSM: 3, ROLE_CEO: 4}
     users = users.assign(_daily_order=users.role.map(role_order).fillna(99)).sort_values(["_daily_order", "id"])
     activities = frame(
-        "SELECT * FROM role_activities WHERE activity_date=?",
+        """SELECT ra.*, u.name, u.role FROM role_activities ra
+           JOIN users u ON u.id = ra.user_id
+           WHERE ra.activity_date=?""",
         (activity_date.isoformat(),),
     )
+    team_totals = {role: aggregate_metrics_for_role(activities, role) for role in (ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM)}
     rows = []
     for user in users.itertuples():
         metrics, submitted = activity_metrics_for_user(activities, user.id)
-        result = scorecard_measure(user.role, metrics, active_providers, dap_today)
+        result = scorecard_measure(user.role, metrics, team_totals)
         if result is None or user.role == ROLE_CEO:
             continue
         measure, evidence = result
@@ -385,8 +439,16 @@ def build_daily_activity_summary(activity_date: date, active_providers: int, dap
 
 def my_leads_page(user: dict) -> None:
     st.title("My provider leads")
-    st.caption("Active provider leads currently assigned to you are listed here. Lost leads stay with you internally but are hidden from this list; they remain visible on the Dashboard and in reports.")
-    query, params = my_provider_query(user, include_lost=False)
+    # Halifa (Market Lead) is where Lost providers land for re-engagement, so
+    # her queue needs to show them. Every other role's queue hides Lost
+    # providers once they've moved on - they stay visible on the Dashboard
+    # and in reports regardless.
+    include_lost = user["role"] == ROLE_ML
+    if include_lost:
+        st.caption("Providers marked Lost are routed to you here so you can re-engage them. Move a provider back to Interested if you reconnect - it will route straight back to Rahul.")
+    else:
+        st.caption("Active provider leads currently assigned to you are listed here. Lost leads are routed to Halifa (Market Lead) for re-engagement and hidden from this list; they remain visible on the Dashboard and in reports.")
+    query, params = my_provider_query(user, include_lost=include_lost)
     providers = frame(query, params)
     with st.expander("Add provider lead", expanded=False):
         with st.form("new_provider", clear_on_submit=True):
@@ -467,9 +529,12 @@ def my_leads_page(user: dict) -> None:
             if stage != record.stage:
                 if next_owner:
                     new_owner_name = next_owner[0].split(",")[0].strip()
-                    st.success(f"Stage updated to {stage}. Assigned to {new_owner_name}.")
+                    if stage == "Lost":
+                        st.success(f"Stage updated to Lost. Assigned to {new_owner_name} for re-engagement. Hidden from your Provider Leads, but stays visible on the Dashboard and in reports.")
+                    else:
+                        st.success(f"Stage updated to {stage}. Assigned to {new_owner_name}.")
                 elif stage == "Lost":
-                    st.success("Stage updated to Lost. This lead is now hidden from My provider leads, but stays visible on the Dashboard and in reports.")
+                    st.success("Stage updated to Lost. Hidden from My provider leads, but stays visible on the Dashboard and in reports.")
                 else:
                     st.success(f"Stage updated to {stage}.")
             else:
