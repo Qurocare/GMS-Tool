@@ -17,7 +17,7 @@ import pandas as pd
 DATA_DIR = Path(__file__).parent / "data"
 DB_PATH = DATA_DIR / "gms.db"
 
-STAGES = ["Research", "New Lead", "Contacted", "Interested", "Meeting Scheduled", "Demo Scheduled", "Demo Completed", "Verification", "Agreement Sent", "Onboarding", "Active Provider", "Lost"]
+STAGES = ["Research", "New Lead", "Contacted", "Interested", "Meeting Scheduled", "Demo Scheduled", "Demo Completed", "Converted", "Verification", "Agreement Sent", "Onboarding", "Active Provider", "Lost"]
 PROVIDER_TYPES = ["Organisation", "Doctor", "Nurse", "Physiotherapist", "Phlebotomist", "Lab", "Other"]
 SOURCES = ["Meta Ads", "Google Ads", "Referral", "Cold Outreach", "Website", "LinkedIn", "Other"]
 PRIORITIES = ["High", "Medium", "Low"]
