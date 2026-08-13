@@ -751,8 +751,87 @@ def user_management_page(user: dict) -> None:
     st.dataframe(accounts.drop(columns=["id", "is_active"]), hide_index=True, width="stretch")
 
 
+def tv_dashboard_page(user: dict) -> None:
+    """Portrait-native summary for the LG TV display: just DAP, AP, and the
+    four core KPIs, computed for today specifically - no date-range picker,
+    no admin detail. A separate view from the full Dashboard so it can use
+    much larger type, sized for reading across a room, and fill a portrait
+    screen without the sidebar/navigation taking up space.
+    """
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] { display: none; }
+        [data-testid="stAppViewContainer"] .main .block-container {
+            padding-top: 2rem; padding-bottom: 2rem; padding-left: 1.5rem; padding-right: 1.5rem;
+            max-width: 100%;
+        }
+        [data-testid="stAppViewContainer"] { background: #0b0f19; }
+        .tv-header { text-align: center; color: #f5f7fa; font-size: 2.6rem; font-weight: 800; margin-bottom: 0.1rem; }
+        .tv-subheader { text-align: center; color: #9aa4b2; font-size: 1.4rem; margin-bottom: 2rem; }
+        .tv-bignum-row { display: flex; justify-content: center; gap: 2.5rem; margin-bottom: 2.5rem; flex-wrap: wrap; }
+        .tv-bignum { text-align: center; }
+        .tv-bignum .value { font-size: 5rem; font-weight: 800; color: #f5f7fa; line-height: 1; }
+        .tv-bignum .label { font-size: 1.3rem; color: #9aa4b2; margin-top: 0.5rem; }
+        .tv-kpi-card { background: #161b26; border-radius: 18px; padding: 1.6rem 1.8rem; margin-bottom: 1.25rem; }
+        .tv-kpi-role { font-size: 1.4rem; color: #9aa4b2; margin-bottom: 0.25rem; }
+        .tv-kpi-row { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 0.5rem; }
+        .tv-kpi-name { font-size: 1.8rem; font-weight: 700; color: #f5f7fa; }
+        .tv-kpi-value { font-size: 3.2rem; font-weight: 800; color: #4fd1c5; }
+        .tv-kpi-evidence { font-size: 1.05rem; color: #6b7684; margin-top: 0.4rem; }
+        .tv-signout { text-align: center; margin-top: 1.5rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    today = date.today()
+    dap_today = 0  # placeholder until Tech connects the provider-app data source
+    ap_total = active_provider_count()
+
+    st.markdown('<div class="tv-header">Qurocare Growth</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="tv-subheader">{today.strftime("%A, %d %B %Y")}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="tv-bignum-row">
+          <div class="tv-bignum"><div class="value">{dap_today}</div><div class="label">Daily Active<br>Providers</div></div>
+          <div class="tv-bignum"><div class="value">{ap_total}</div><div class="label">Active<br>Providers</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    for role in (ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM):
+        for metric_name, value, evidence in role_kpi(role, today, today, dap_today, ap_total):
+            st.markdown(
+                f"""
+                <div class="tv-kpi-card">
+                  <div class="tv-kpi-role">{role}</div>
+                  <div class="tv-kpi-row">
+                    <div class="tv-kpi-name">{metric_name}</div>
+                    <div class="tv-kpi-value">{value}</div>
+                  </div>
+                  <div class="tv-kpi-evidence">{evidence}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown('<div class="tv-signout">', unsafe_allow_html=True)
+    if st.button("Sign out", icon=":material/logout:"):
+        st.session_state["gms_user"] = None
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 def main_app() -> None:
     user = current_user()
+    if user["role"] == ROLE_DISPLAY:
+        # The Display account only ever shows the TV view, full-page, with
+        # no sidebar or navigation - it's meant to be captured and shown on
+        # the LG signage screen, not browsed interactively.
+        tv_dashboard_page(user)
+        return
     with st.sidebar:
         st.title("Qurocare GMS")
         st.caption(user["role"])
@@ -760,9 +839,7 @@ def main_app() -> None:
             st.session_state["gms_user"] = None
             st.rerun()
         st.divider()
-        if user["role"] == ROLE_DISPLAY:
-            pages = ["Dashboard"]
-        elif user["role"] == ROLE_PGA:
+        if user["role"] == ROLE_PGA:
             pages = ["Dashboard", "My provider leads"]
         else:
             pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback"]
