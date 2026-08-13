@@ -304,6 +304,27 @@ def count_stage_events(start_date, end_date, to_stage: str | None = None, sub_st
     return int(result.iloc[0].c) if not result.empty else 0
 
 
+def stage_log_for_user(user_id: int, start_date=None, end_date=None) -> pd.DataFrame:
+    """Every stage change one person made, newest first, with the
+    organization name joined in. Leave start_date/end_date as None for the
+    person's full history."""
+    conditions = ["sh.changed_by_user_id=?"]
+    params: list = [user_id]
+    if start_date:
+        conditions.append("sh.changed_at >= ?")
+        params.append(start_date.isoformat())
+    if end_date:
+        conditions.append("sh.changed_at < ?")
+        params.append((end_date + timedelta(days=1)).isoformat())
+    return frame(
+        f"""SELECT sh.changed_at, p.company_name, sh.from_stage, sh.to_stage, sh.sub_stage
+           FROM stage_history sh JOIN providers p ON p.id = sh.provider_id
+           WHERE {' AND '.join(conditions)}
+           ORDER BY sh.changed_at DESC""",
+        tuple(params),
+    )
+
+
 def user_count() -> int:
     with connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
