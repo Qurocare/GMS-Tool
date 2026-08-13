@@ -11,7 +11,7 @@ from db import (
     ROLE_BDM, ROLE_CEO, ROLE_DISPLAY, ROLE_ML, ROLE_MO, ROLE_PGA, ROLE_PSM, SOURCES, STAGES,
     SUB_STAGE_DEMO_NOT_SCHEDULING, SUB_STAGE_DEMO_SCHEDULING, SUB_STAGE_ONBOARDING_REQUESTED,
     SUB_STAGE_VERIFICATION_REQUESTED, authenticate, count_stage_events, create_user, execute,
-    frame, initialise, log_stage_change, user_count, users_frame,
+    frame, initialise, log_stage_change, stage_log_for_user, user_count, users_frame,
 )
 
 st.set_page_config(page_title="Qurocare GMS", page_icon=":material/health_and_safety:", layout="wide")
@@ -572,7 +572,9 @@ def my_activity_page(user: dict) -> None:
         st.info("This account does not submit operational activity.")
         return
     st.caption(f"Your activity is saved under your account ({user['role']}). Only you can edit these entries.")
+
     with st.form("new_activity", clear_on_submit=True):
+        st.caption("Manually entered")
         activity_date = st.date_input("Activity date", value=date.today())
         columns = st.columns(min(3, len(fields)))
         values = {}
@@ -583,16 +585,65 @@ def my_activity_page(user: dict) -> None:
             execute("INSERT INTO role_activities (user_id, activity_date, metrics_json, notes) VALUES (?, ?, ?, ?)", (user["id"], activity_date.isoformat(), json.dumps(values), notes.strip()))
             st.success("Activity saved.")
             st.rerun()
+
+    st.divider()
+    st.subheader("Review my activity for a date")
+    review_date = st.date_input("Select a date to review", value=date.today(), max_value=date.today(), key="activity_review_date")
+
+    st.markdown("**Manually entered on this date**")
+    manual_today = frame("SELECT metrics_json, notes FROM role_activities WHERE user_id=? AND activity_date=? ORDER BY id DESC", (user["id"], review_date.isoformat()))
+    if manual_today.empty:
+        st.caption("No manual entry submitted for this date.")
+    else:
+        for _, row in manual_today.iterrows():
+            metrics = json.loads(row.metrics_json)
+            st.write(" · ".join(f"{label}: {metrics.get(key, 0)}" for key, label in fields))
+            if row.notes:
+                st.caption(f"Notes: {row.notes}")
+
+    st.markdown("**Automatically logged on this date** (from your stage changes)")
+    log = stage_log_for_user(user["id"], review_date, review_date)
+    if log.empty:
+        st.caption("No stage changes logged for this date.")
+    else:
+        # Rollup counts: how many times each stage was reached, and each
+        # sub-stage flag was set, on this date - so the numbers don't have
+        # to be counted by hand from the detailed rows below.
+        stage_counts = log.to_stage.value_counts()
+        sub_stage_counts: dict[str, int] = {}
+        for value in log.sub_stage.dropna():
+            for flag in [f.strip() for f in value.split(",") if f.strip()]:
+                sub_stage_counts[flag] = sub_stage_counts.get(flag, 0) + 1
+        rollup = [f"{stage}: {count}" for stage, count in stage_counts.items()]
+        rollup += [f"{flag}: {count}" for flag, count in sub_stage_counts.items()]
+        st.caption(" · ".join(rollup))
+
+        display_log = log.copy()
+        display_log.columns = ["Time", "Organization", "From stage", "To stage", "Sub-stage"]
+        st.dataframe(display_log, hide_index=True, width="stretch")
+
+    st.divider()
+    st.subheader("Full activity log")
+    st.caption("Every stage change you've made, across all time.")
+    full_log = stage_log_for_user(user["id"])
+    if full_log.empty:
+        st.info("No stage changes logged yet.")
+    else:
+        full_log_display = full_log.copy()
+        full_log_display.columns = ["Time", "Organization", "From stage", "To stage", "Sub-stage"]
+        export_button(full_log_display, "my-stage-activity-log")
+        st.dataframe(full_log_display, hide_index=True, width="stretch")
+
+    st.subheader("My manual activity history")
     data = frame("SELECT id, activity_date, metrics_json, notes FROM role_activities WHERE user_id=? ORDER BY activity_date DESC, id DESC", (user["id"],))
-    st.subheader("My activity history")
     if data.empty:
-        st.info("No activity submitted yet.")
+        st.info("No manual activity submitted yet.")
         return
     display = data.copy()
     for key, label in fields:
         display[label] = display.metrics_json.apply(lambda value: json.loads(value).get(key, 0))
     display = display.drop(columns=["id", "metrics_json"])
-    export_button(display, "my-activity")
+    export_button(display, "my-manual-activity")
     st.dataframe(display, hide_index=True, width="stretch")
     record_id = st.selectbox("Edit my activity entry", data.id.tolist(), format_func=lambda x: f"Activity #{x}")
     record = data[data.id == record_id].iloc[0]
