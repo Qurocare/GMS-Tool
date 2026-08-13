@@ -10,6 +10,7 @@ import hmac
 import os
 import sqlite3
 import struct
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -17,28 +18,72 @@ import pandas as pd
 DATA_DIR = Path(__file__).parent / "data"
 DB_PATH = DATA_DIR / "gms.db"
 
-STAGES = ["Research", "New Lead", "Contacted", "Interested", "Meeting Scheduled", "Demo Scheduled", "Demo Completed", "Converted", "Verification", "Agreement Sent", "Onboarding", "Active Provider", "Lost"]
+STAGES = [
+    "Provider Identified", "Provider Qualified", "Contacted for Demo Scheduling",
+    "Demo Scheduled", "Demo Completed", "Converted/ACTIVE Provider",
+    "Provider Active Onboarded (PAO)", "Provider Active Not-Onboarded (PANO)",
+    "Provider Verified", "Provider Not Verified", "Lost",
+]
 PROVIDER_TYPES = ["Organisation", "Doctor", "Nurse", "Physiotherapist", "Phlebotomist", "Lab", "Other"]
 SOURCES = ["Meta Ads", "Google Ads", "Referral", "Cold Outreach", "Website", "LinkedIn", "Other"]
 PRIORITIES = ["High", "Medium", "Low"]
 FEEDBACK_CATEGORIES = ["Bug", "Feature Request", "UI / UX", "Onboarding", "Pricing", "Training", "Other"]
 FEEDBACK_STATUSES = ["New", "Reviewed", "Sent to Tech", "In Progress", "Resolved", "Deferred"]
 
-ROLE_PSM = "PSM"
-ROLE_MO = "Medical Officer"
-ROLE_ML = "Market Lead"
-ROLE_BDM = "Business Development Manager"
-ROLE_PGA = "Product Growth Associate"
+# Sub-stage values, stored alongside (not instead of) the main stage. Some
+# stages carry a checkbox/choice that changes ownership routing without
+# being a stage of its own.
+SUB_STAGE_DEMO_SCHEDULING = "Demo Scheduling"
+SUB_STAGE_DEMO_NOT_SCHEDULING = "Demo not Scheduling"
+SUB_STAGE_ONBOARDING_REQUESTED = "Onboarding requested"
+SUB_STAGE_VERIFICATION_REQUESTED = "Verification requested"
+
+ROLE_PSM = "Provider Success"
+ROLE_MO = "Provider Verification"
+ROLE_ML = "Market Intelligence"
+ROLE_BDM = "Provider Partnerships"
+ROLE_PGA = "Growth Associate"
 ROLE_CEO = "CEO/Admin"
 ROLE_DISPLAY = "Display only"
 ROLES = [ROLE_PSM, ROLE_MO, ROLE_ML, ROLE_BDM, ROLE_PGA, ROLE_CEO, ROLE_DISPLAY]
+# Kept for the "team member" dropdown when creating an account. No personal
+# names are stored here on purpose - the person creating the account types
+# the real name in, this just seeds sensible role choices.
 DEFAULT_TEAM = [
-    ("Halifa", ROLE_ML),
-    ("Rahul", ROLE_BDM),
-    ("Dr. Asinsha", ROLE_MO),
-    ("Reshma", ROLE_PSM),
-    ("Simoy", ROLE_PGA),
+    ("Market Intelligence", ROLE_ML),
+    ("Provider Partnerships", ROLE_BDM),
+    ("Provider Verification", ROLE_MO),
+    ("Provider Success", ROLE_PSM),
+    ("Growth Associate", ROLE_PGA),
 ]
+
+# Best-effort mapping from the old workflow's role/stage names to the new
+# ones, applied once on startup so existing pilot data keeps working under
+# the rebuilt workflow rather than being orphaned by the rename. Stage
+# mapping is necessarily approximate where the old stage had no exact new
+# equivalent (e.g. the old in-progress "Verification"/"Onboarding" stages,
+# whose outcome wasn't recorded) - those land on a safe, non-committal stage
+# so the team can quickly re-triage the handful of affected records rather
+# than losing them.
+_ROLE_RENAMES = {
+    "Market Lead": ROLE_ML,
+    "Business Development Manager": ROLE_BDM,
+    "Medical Officer": ROLE_MO,
+    "PSM": ROLE_PSM,
+    "Product Growth Associate": ROLE_PGA,
+}
+_STAGE_RENAMES = {
+    "Research": "Provider Identified",
+    "New Lead": "Provider Identified",
+    "Interested": "Provider Qualified",
+    "Contacted": "Contacted for Demo Scheduling",
+    "Meeting Scheduled": "Contacted for Demo Scheduling",
+    "Converted": "Converted/ACTIVE Provider",
+    "Verification": "Converted/ACTIVE Provider",
+    "Agreement Sent": "Converted/ACTIVE Provider",
+    "Onboarding": "Provider Active Not-Onboarded (PANO)",
+    "Active Provider": "Provider Active Not-Onboarded (PANO)",
+}
 
 
 def connect() -> sqlite3.Connection:
@@ -147,12 +192,25 @@ def initialise() -> None:
                 FOREIGN KEY(submitted_by_user_id) REFERENCES users(id),
                 FOREIGN KEY(reviewed_by_user_id) REFERENCES users(id)
             );
+            CREATE TABLE IF NOT EXISTS stage_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_id INTEGER NOT NULL,
+                from_stage TEXT,
+                to_stage TEXT NOT NULL,
+                sub_stage TEXT,
+                changed_by_user_id INTEGER,
+                changed_by_role TEXT,
+                changed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(provider_id) REFERENCES providers(id),
+                FOREIGN KEY(changed_by_user_id) REFERENCES users(id)
+            );
             """
         )
         # Preserve existing pilot data while making ownership auditable.
         for column, definition in [
             ("created_by_user_id", "INTEGER"), ("assigned_to_user_id", "INTEGER"),
             ("updated_by_user_id", "INTEGER"), ("updated_at", "TEXT"),
+            ("sub_stage", "TEXT"), ("org_contact_number", "TEXT"),
         ]:
             _ensure_column(conn, "providers", column, definition)
         for column, definition in [("submitted_by_user_id", "INTEGER"), ("updated_by_user_id", "INTEGER"), ("updated_at", "TEXT")]:
@@ -166,6 +224,21 @@ def initialise() -> None:
             AND assigned_to IN ('Growth Lead', 'Growth Executive 1', 'Growth Executive 2')"""
         )
         _repair_corrupted_owner_ids(conn)
+        _migrate_role_and_stage_names(conn)
+
+
+def _migrate_role_and_stage_names(conn: sqlite3.Connection) -> None:
+    """One-time rename from the old role/stage vocabulary to the new one.
+
+    Role names map cleanly (old role -> new role, same person/account). Stage
+    names are only an approximate mapping where the old stage had no exact
+    equivalent under the new, more detailed workflow - see _STAGE_RENAMES.
+    Safe to run repeatedly: once renamed, old values no longer exist to match.
+    """
+    for old_role, new_role in _ROLE_RENAMES.items():
+        conn.execute("UPDATE users SET role=? WHERE role=?", (new_role, old_role))
+    for old_stage, new_stage in _STAGE_RENAMES.items():
+        conn.execute("UPDATE providers SET stage=? WHERE stage=?", (new_stage, old_stage))
 
 
 def _repair_corrupted_owner_ids(conn: sqlite3.Connection) -> None:
@@ -202,6 +275,35 @@ def execute(query: str, params: tuple = ()) -> None:
         conn.commit()
 
 
+def log_stage_change(provider_id: int, from_stage: str | None, to_stage: str, sub_stage: str, user: dict) -> None:
+    """Record a provider stage/sub-stage change in the audit log.
+
+    This is what makes every KPI (M, Q, C, RO, O, RV, V) countable
+    automatically instead of manually typed in - each is just a count of
+    matching rows here for the selected date range.
+    """
+    execute(
+        """INSERT INTO stage_history (provider_id, from_stage, to_stage, sub_stage, changed_by_user_id, changed_by_role)
+        VALUES (?, ?, ?, ?, ?, ?)""",
+        (provider_id, from_stage, to_stage, sub_stage, user["id"], user["role"]),
+    )
+
+
+def count_stage_events(start_date, end_date, to_stage: str | None = None, sub_stage_contains: str | None = None) -> int:
+    """Count stage_history rows in a date range (inclusive), optionally
+    filtered by the resulting stage and/or a sub-stage flag being present."""
+    conditions = ["changed_at >= ? AND changed_at < ?"]
+    params: list = [start_date.isoformat(), (end_date + timedelta(days=1)).isoformat()]
+    if to_stage:
+        conditions.append("to_stage = ?")
+        params.append(to_stage)
+    if sub_stage_contains:
+        conditions.append("sub_stage LIKE ?")
+        params.append(f"%{sub_stage_contains}%")
+    result = frame(f"SELECT COUNT(*) AS c FROM stage_history WHERE {' AND '.join(conditions)}", tuple(params))
+    return int(result.iloc[0].c) if not result.empty else 0
+
+
 def user_count() -> int:
     with connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -210,7 +312,7 @@ def user_count() -> int:
 def create_user(name: str, role: str, email: str, password: str) -> None:
     with connect() as conn:
         conn.execute("INSERT INTO users (name, role, email, password_hash) VALUES (?, ?, ?, ?)", (name, role, email.strip().lower(), hash_password(password)))
-        conn.commit() 
+        conn.commit()
 
 
 def authenticate(email: str, password: str) -> dict | None:
@@ -223,7 +325,3 @@ def authenticate(email: str, password: str) -> dict | None:
 
 def users_frame() -> pd.DataFrame:
     return frame("SELECT id, name, role, email, is_active, created_at FROM users ORDER BY id")
-
-
-def user_label(user: dict) -> str:
-    return f"{user['name']}, {user['role']}"
