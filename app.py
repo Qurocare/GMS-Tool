@@ -7,43 +7,40 @@ import pandas as pd
 import streamlit as st
 
 from db import (
-    DEFAULT_TEAM, FEEDBACK_CATEGORIES, FEEDBACK_STATUSES, PRIORITIES, PROVIDER_TYPES,
-    ROLE_BDM, ROLE_CEO, ROLE_DISPLAY, ROLE_ML, ROLE_MO, ROLE_PGA, ROLE_PSM, SOURCES, STAGES, authenticate,
-    create_user, execute, frame, initialise, user_count, user_label, users_frame,
+    FEEDBACK_CATEGORIES, FEEDBACK_STATUSES, PRIORITIES, PROVIDER_TYPES,
+    ROLE_BDM, ROLE_CEO, ROLE_DISPLAY, ROLE_ML, ROLE_MO, ROLE_PGA, ROLE_PSM, SOURCES, STAGES,
+    SUB_STAGE_DEMO_NOT_SCHEDULING, SUB_STAGE_DEMO_SCHEDULING, SUB_STAGE_ONBOARDING_REQUESTED,
+    SUB_STAGE_VERIFICATION_REQUESTED, authenticate, count_stage_events, create_user, execute,
+    frame, initialise, log_stage_change, user_count, users_frame,
 )
 
 st.set_page_config(page_title="Qurocare GMS", page_icon=":material/health_and_safety:", layout="wide")
 initialise()
 st.session_state.setdefault("gms_user", None)
 
+# Manual daily entry, by role. Everything else (every stage move and every
+# sub-stage checkbox) is logged automatically to stage_history the moment it
+# happens, and the KPIs are computed from that log - nobody types in a
+# converted/verified/qualified count by hand any more.
 ACTIVITY_FIELDS = {
     ROLE_ML: [
-        ("providers_researched", "Providers researched"),
-        ("meaningful_conversations", "Meaningful provider conversations (M)"),
-        ("leads_qualified", "Qualified interested leads added to GMS (QIL)"),
-        ("demos_supported", "Demos supported"),
-        ("lost_cases_handled", "Lost cases handled (re-engagement calls)"),
-        ("followups_completed", "Follow-ups completed"),
+        ("researches", "Researches"),
+        ("calls", "Calls"),
+        ("demos_supported", "Demo supported"),
     ],
     ROLE_BDM: [
-        ("qualified_leads_contacted", "Qualified leads contacted (QLC)"),
-        ("demos_completed", "Demos completed (does not by itself mean converted)"),
-        ("converted_leads", "Converted leads - moved to Converted stage (C)"),
-        ("followups_completed", "Follow-ups completed"),
+        ("researches", "Researches"),
+        ("calls", "Calls"),
     ],
     ROLE_PSM: [
-        ("demos_conducted", "Demos conducted"),
-        ("providers_ready_for_onboarding", "Verified providers ready for onboarding (V)"),
-        ("providers_ready_to_activate", "Providers ready to activate (AP)"),
-        ("feedback_logged", "Provider feedback logged"),
-        ("tech_followups", "Tech follow-ups"),
+        ("researches", "Researches"),
+        ("calls", "Calls"),
+        ("demos_supported", "Demo supported"),
     ],
     ROLE_MO: [
-        ("demos_supported", "Demos supported"),
-        ("converted_leads_received", "Converted leads received for verification (C)"),
-        ("documents_reviewed", "Documents reviewed"),
-        ("verifications_completed", "Verifications completed (V)"),
-        ("followups_completed", "Follow-ups completed"),
+        ("researches", "Researches"),
+        ("calls", "Calls"),
+        ("demos_supported", "Demo supported"),
     ],
     ROLE_PGA: [],
     ROLE_CEO: [],
@@ -59,53 +56,79 @@ def is_management(user: dict) -> bool:
 
 
 def owner_for_role(role: str) -> tuple[str, int] | None:
-    """Return the active GMS account responsible for a workflow role."""
+    """Return the active GMS account responsible for a workflow role.
+
+    The label returned is the role itself, not the person's name - names are
+    not shown anywhere in the operational UI. The account's real identity is
+    still tracked via the id (and stage_history.changed_by_user_id) for
+    anyone who needs to audit who actually did what.
+    """
     users = frame(
-        "SELECT id, name, role FROM users WHERE role=? AND is_active=1 ORDER BY id LIMIT 1",
+        "SELECT id, role FROM users WHERE role=? AND is_active=1 ORDER BY id LIMIT 1",
         (role,),
     )
     if users.empty:
         return None
     owner = users.iloc[0]
-    # Use bracket access for the 'name' column: attribute access (owner.name)
-    # collides with pandas' built-in Series.name property (the row's index),
-    # which silently returned a row number instead of the person's name.
-    return f"{owner['name']}, {owner['role']}", int(owner['id'])
+    return owner["role"], int(owner["id"])
 
 
-def workflow_owner_for_stage(stage: str) -> tuple[str, int] | None:
-    """Return the next owner when a provider reaches a handoff stage.
+def resolve_ownership(stage: str, demo_choice: str | None, onboarding_requested: bool, verification_requested: bool) -> tuple[tuple[str, int] | None, str]:
+    """Return (next_owner_or_None, sub_stage_text) for a stage change.
 
-    Ownership moves automatically at four defined handoff points:
-    - Rahul (BDM) -> Dr. Asinsha (MO) when Converted is selected (a lead can
-      complete a demo without being converted, so the BDM->MO hand-off now
-      happens at Converted, not at Demo Completed or Verification).
-    - Dr. Asinsha (MO) -> Reshma (PSM) when Onboarding is selected.
-    - Anyone -> Halifa (Market Lead) when Lost is selected, so she can
-      re-engage the lead rather than it sitting orphaned with whoever last
-      touched it.
-    - Halifa (Market Lead) -> Rahul (BDM) when Interested is selected, so a
-      lead she re-engages routes straight back into Rahul's pipeline.
-    Every other stage change keeps the current owner so the provider does
-    not disappear from their Provider Leads page mid-workflow.
+    Ownership moves automatically at these points:
+    - Provider Qualified -> Provider Partnerships, whichever of the two demo
+      sub-stages is chosen (both route the same way; Partnerships handles
+      getting the demo actually scheduled either way).
+    - Converted/ACTIVE Provider -> Provider Success by default. If only
+      "Request for Verification" is checked (no Onboarding), it goes
+      straight to Provider Verification instead, skipping Success entirely -
+      the self-onboarded case. If Onboarding is checked (with or without
+      Verification), it goes to Provider Success either way, since Success
+      has to do the onboarding work first; a pre-checked Verification
+      request just carries forward as the sub-stage.
+    - Provider Active Onboarded / Not-Onboarded -> stays with Provider
+      Success, unless "Request for Verification" is checked, which sends it
+      to Provider Verification.
+    - Provider Verified / Provider Not Verified -> Provider Success either
+      way, for ongoing DAP monitoring.
+    - Lost -> Market Intelligence, from wherever it's marked (only Market
+      Intelligence and Provider Partnerships can mark a provider Lost).
+    Every other stage carries no ownership change.
     """
-    handoff_roles = {
-        "Converted": ROLE_MO,
-        "Onboarding": ROLE_PSM,
-        "Lost": ROLE_ML,
-        "Interested": ROLE_BDM,
-    }
-    role = handoff_roles.get(stage)
-    return owner_for_role(role) if role else None
+    if stage == "Provider Qualified":
+        return owner_for_role(ROLE_BDM), (demo_choice or "")
+    if stage == "Converted/ACTIVE Provider":
+        flags = []
+        if onboarding_requested:
+            flags.append(SUB_STAGE_ONBOARDING_REQUESTED)
+        if verification_requested:
+            flags.append(SUB_STAGE_VERIFICATION_REQUESTED)
+        sub_stage = ", ".join(flags)
+        if onboarding_requested:
+            return owner_for_role(ROLE_PSM), sub_stage
+        if verification_requested:
+            return owner_for_role(ROLE_MO), sub_stage
+        return owner_for_role(ROLE_PSM), sub_stage
+    if stage in ("Provider Active Onboarded (PAO)", "Provider Active Not-Onboarded (PANO)"):
+        sub_stage = SUB_STAGE_VERIFICATION_REQUESTED if verification_requested else ""
+        if verification_requested:
+            return owner_for_role(ROLE_MO), sub_stage
+        return None, sub_stage
+    if stage in ("Provider Verified", "Provider Not Verified"):
+        return owner_for_role(ROLE_PSM), ""
+    if stage == "Lost":
+        return owner_for_role(ROLE_ML), ""
+    return None, ""
 
 
 def allowed_stages_for_role(user: dict, current_stage: str) -> list[str]:
     """Limit workflow changes to the stages owned by the signed-in role."""
     allowed_by_role = {
-        ROLE_BDM: ["Interested", "Contacted", "Meeting Scheduled", "Demo Scheduled", "Demo Completed", "Converted", "Lost"],
-        ROLE_MO: ["Converted", "Verification", "Agreement Sent", "Onboarding", "Lost"],
-        ROLE_PSM: ["Onboarding", "Active Provider", "Lost"],
-        ROLE_ML: ["Lost", "Interested"],
+        ROLE_ML: ["Provider Identified", "Provider Qualified", "Lost"],
+        ROLE_BDM: ["Contacted for Demo Scheduling", "Demo Scheduled", "Demo Completed", "Converted/ACTIVE Provider", "Lost"],
+        ROLE_PSM: ["Provider Active Onboarded (PAO)", "Provider Active Not-Onboarded (PANO)"],
+        ROLE_MO: ["Provider Verified", "Provider Not Verified"],
         ROLE_CEO: STAGES,
     }
     allowed = allowed_by_role.get(user["role"], [current_stage])
@@ -151,23 +174,25 @@ def my_provider_query(user: dict, include_lost: bool = True) -> tuple[str, tuple
 
 def setup_first_admin() -> None:
     st.title("Set up Qurocare GMS")
-    st.info("Create the first local pilot account for Reshma, PSM. Before web deployment, this local login will be replaced by Supabase Auth.")
+    st.info("Create the first local pilot account for the Provider Success role. Before web deployment, this local login will be replaced by Supabase Auth.")
     with st.form("first_admin"):
-        email = st.text_input("Reshma's work email")
+        name = st.text_input("Your name (for internal records only - not shown elsewhere in the app)")
+        email = st.text_input("Work email")
         password = st.text_input("Create password", type="password")
         confirm = st.text_input("Confirm password", type="password")
         if st.form_submit_button("Create first account", type="primary"):
-            if not email.strip() or len(password) < 8:
-                st.error("Enter a work email and a password of at least 8 characters.")
+            if not name.strip() or not email.strip() or len(password) < 8:
+                st.error("Enter your name, a work email, and a password of at least 8 characters.")
             elif password != confirm:
                 st.error("Passwords do not match.")
             else:
-                create_user("Reshma", ROLE_PSM, email, password)
-                reshma = authenticate(email, password)
-                # Preserve existing pilot records by making the first Growth Lead
-                # their accountable owner. Future records use the logged-in user.
-                execute("UPDATE providers SET created_by_user_id=?, assigned_to_user_id=?, assigned_to=?, updated_by_user_id=? WHERE created_by_user_id IS NULL AND assigned_to_user_id IS NULL", (reshma["id"], reshma["id"], user_label(reshma), reshma["id"]))
-                execute("UPDATE feedback SET submitted_by_user_id=?, updated_by_user_id=? WHERE submitted_by_user_id IS NULL", (reshma["id"], reshma["id"]))
+                create_user(name.strip(), ROLE_PSM, email, password)
+                first_user = authenticate(email, password)
+                # Preserve existing pilot records by making the first Provider
+                # Success account their accountable owner. Future records use
+                # the logged-in user.
+                execute("UPDATE providers SET created_by_user_id=?, assigned_to_user_id=?, assigned_to=?, updated_by_user_id=? WHERE created_by_user_id IS NULL AND assigned_to_user_id IS NULL", (first_user["id"], first_user["id"], first_user["role"], first_user["id"]))
+                execute("UPDATE feedback SET submitted_by_user_id=?, updated_by_user_id=? WHERE submitted_by_user_id IS NULL", (first_user["id"], first_user["id"]))
                 st.success("Account created. Please sign in.")
                 st.rerun()
 
@@ -198,22 +223,22 @@ def dashboard_page(user: dict) -> None:
     # data source after the Tech team confirms the DAP event definition.
     dap_today = 0
     total = len(providers)
-    active = int((providers.stage == "Active Provider").sum()) if total else 0
     demos = int(providers.stage.isin(["Demo Scheduled", "Demo Completed"]).sum()) if total else 0
-    converted = int((providers.stage == "Converted").sum()) if total else 0
-    onboarding = int((providers.stage == "Onboarding").sum()) if total else 0
-    conversion = active / total * 100 if total else 0
+    converted_active = int((providers.stage == "Converted/ACTIVE Provider").sum()) if total else 0
+    pao = int((providers.stage == "Provider Active Onboarded (PAO)").sum()) if total else 0
+    pano = int((providers.stage == "Provider Active Not-Onboarded (PANO)").sum()) if total else 0
+    ap_total = active_provider_count()
     due_dates = pd.to_datetime(providers.get("next_follow_up"), errors="coerce") if total else pd.Series(dtype="datetime64[ns]")
     due = int((due_dates.dt.date <= date.today()).sum()) if not due_dates.empty else 0
     with st.container(horizontal=True):
         st.metric("Total leads", total, border=True)
         st.metric("Demos", demos, border=True, help="Demo Scheduled + Demo Completed. A completed demo does not by itself mean the lead converted.")
-        st.metric("Converted", converted, border=True, help="Leads Rahul has moved to Converted, now with Dr. Asinsha awaiting Verification.")
-        st.metric("Onboarding", onboarding, border=True)
-        st.metric("Active providers", active, border=True)
+        st.metric("Converted/ACTIVE", converted_active, border=True, help="Providers currently sitting at Converted/ACTIVE Provider, not yet moved into PAO/PANO or Verification.")
+        st.metric("PAO", pao, border=True, help="Provider Active Onboarded - Provider Success personally helped onboard these.")
+        st.metric("PANO", pano, border=True, help="Provider Active Not-Onboarded - active, but self-onboarded without Provider Success's help.")
+        st.metric("Active providers (AP)", ap_total, border=True, help="Running total of every provider at Converted/ACTIVE or later, regardless of period selected below.")
         st.metric("Daily active providers (DAP)", dap_today, border=True,
                   help="Currently shown as 0 until the provider-app data integration is available.")
-        st.metric("Conversion", f"{conversion:.1f}%", border=True)
         st.metric("Follow-ups due", due, border=True)
     st.caption("DAP is temporarily set to 0. It will update automatically after Tech connects the agreed provider-app data source.")
 
@@ -242,7 +267,7 @@ def dashboard_page(user: dict) -> None:
             start_date = end_date = selected_range if isinstance(selected_range, date) else today
     else:
         start_date = end_date = today
-    st.caption(f"Scorecards below use activity submitted from {start_date.strftime('%d %b %Y')} to {end_date.strftime('%d %b %Y')}.")
+    st.caption(f"KPIs below are computed from stage changes made from {start_date.strftime('%d %b %Y')} to {end_date.strftime('%d %b %Y')}.")
 
     col_a, col_b = st.columns((1.2, 1))
     with col_a:
@@ -254,7 +279,7 @@ def dashboard_page(user: dict) -> None:
     with col_b:
         with st.container(border=True):
             st.subheader("Team scorecards")
-            scorecards = build_scorecards(start_date, end_date, dap_today)
+            scorecards = build_scorecards(start_date, end_date, dap_today, ap_total)
             st.dataframe(scorecards, hide_index=True, width="stretch")
 
     with st.container(border=True):
@@ -271,12 +296,12 @@ def dashboard_page(user: dict) -> None:
         st.subheader("Shared provider register")
         st.caption("Read-only provider pipeline for the full Growth team. Download it when you need a working copy.")
         register = providers[[
-            "id", "company_name", "provider_type", "contact_name", "phone", "email",
-            "source", "assigned_to", "stage", "priority", "date_added", "next_follow_up", "remarks",
+            "id", "company_name", "provider_type", "contact_name", "phone", "org_contact_number", "email",
+            "source", "assigned_to", "stage", "sub_stage", "priority", "date_added", "next_follow_up", "remarks",
         ]].copy()
         register.columns = [
-            "ID", "Provider", "Type", "Contact", "Phone", "Email", "Source",
-            "Current owner", "Current stage", "Priority", "Date added", "Next follow-up", "Remarks",
+            "ID", "Provider", "Type", "Contact", "Contact phone", "Org phone", "Email", "Source",
+            "Current owner", "Current stage", "Sub-stage", "Priority", "Date added", "Next follow-up", "Remarks",
         ]
         export_button(register, "qurocare-shared-provider-register")
         st.dataframe(register, hide_index=True, width="stretch")
@@ -289,13 +314,15 @@ def dashboard_page(user: dict) -> None:
             max_value=today,
             key="daily_activity_date",
         )
-        st.caption("This shows whether each scored team member submitted activity on the selected date, with that day’s outcome measure.")
-        daily_activity = build_daily_activity_summary(selected_day, dap_today)
+        st.caption("This shows whether each role submitted its manual daily entry (Researches / Calls / Demo supported) on the selected date.")
+        daily_activity = build_daily_activity_summary(selected_day)
         st.dataframe(daily_activity, hide_index=True, width="stretch")
 
 
 def activity_metrics_for_user(activities: pd.DataFrame, user_id: int) -> tuple[dict, bool]:
-    """Add all activity values for one user and report whether they submitted."""
+    """Add all manually-entered activity values for one user and report
+    whether they submitted anything for the period (Researches, Calls, Demo
+    supported - everything else is derived automatically, see role_kpi)."""
     metrics: dict[str, int] = {}
     if activities.empty:
         return metrics, False
@@ -305,112 +332,79 @@ def activity_metrics_for_user(activities: pd.DataFrame, user_id: int) -> tuple[d
     return metrics, not entries.empty
 
 
-def scorecard_measures(role: str, metrics: dict, dap_today: int) -> list[tuple[str, str, str]]:
-    """Return a list of (metric name, measure, evidence) tuples for a role.
+def active_provider_count() -> int:
+    """AP: providers currently at Converted/ACTIVE Provider or any stage
+    downstream of it. A running total, not scoped to a date range."""
+    active_stages = (
+        "Converted/ACTIVE Provider", "Provider Active Onboarded (PAO)",
+        "Provider Active Not-Onboarded (PANO)", "Provider Verified", "Provider Not Verified",
+    )
+    placeholders = ",".join("?" for _ in active_stages)
+    result = frame(f"SELECT COUNT(*) AS c FROM providers WHERE stage IN ({placeholders})", active_stages)
+    return int(result.iloc[0].c) if not result.empty else 0
 
-    Every formula below uses only that same person's own submitted activity
-    fields (each role logs both the numerator and denominator it needs), so
-    the numbers are self-contained per person. Formula definitions, as
-    agreed with the CEO:
 
-    - Halifa (Market Lead) - Quality lead rate = QIL / M x 100
-        QIL = Qualified interested leads added to GMS (her own activity)
-        M   = Meaningful provider conversations (her own activity)
-    - Rahul (BDM) - Conversion rate = C / QLC x 100
-        C   = Converted leads, i.e. leads moved to the Converted stage (his own activity)
-        QLC = Qualified leads contacted (his own activity)
-    - Dr. Asinsha (MO) - Verification completion rate = V / C x 100
-        V = Verifications completed (her own activity)
-        C = Converted leads received for verification (her own activity)
-    - Reshma (PSM) - Activation-ready rate = AP / V x 100
-        AP = Providers ready to activate (her own activity)
-        V  = Verified providers ready for onboarding (her own activity)
-      Reshma also gets a second measure, DAP coverage = DAP / AP x 100
-        DAP = Daily active providers (dashboard placeholder, currently 0
-              until Tech connects the provider-app data source)
-        AP  = Providers ready to activate (her own activity, same as above)
+def role_kpi(role: str, start_date: date, end_date: date, dap_today: int, ap_total: int) -> list[tuple[str, str, str]]:
+    """Return a list of (KPI short name, value, evidence) for a role.
+
+    Every number here comes from stage_history for the selected period - not
+    from anyone's manually typed activity - so this is one shared, team-wide
+    figure per role rather than a per-person number. Formula definitions, as
+    finalized:
+
+    - Market Intelligence - LQR = Q / M x 100
+    - Provider Partnerships - LCR = C / Q x 100
+    - Provider Success - OSR = O / RO x 100, and DAP Coverage = DAP / AP x 100
+        (AP here is the running total of all active providers, not scoped
+        to the period; DAP is the dashboard's daily-active-providers figure)
+    - Provider Verification - VCR = V / RV x 100
     """
     if role == ROLE_ML:
-        conversations = metrics.get("meaningful_conversations", 0)
-        qualified = metrics.get("leads_qualified", 0)
-        rate = (qualified / conversations * 100) if conversations else 0
-        return [(
-            "Quality lead rate",
-            f"{rate:.0f}%",
-            f"{qualified} qualified leads (QIL) from {conversations} meaningful conversations (M)",
-        )]
+        m = count_stage_events(start_date, end_date, to_stage="Provider Identified")
+        q = count_stage_events(start_date, end_date, to_stage="Provider Qualified")
+        rate = (q / m * 100) if m else 0
+        return [("LQR", f"{rate:.0f}%", f"{q} Qualified (Q) from {m} Identified/Meaningful conversations (M)")]
     if role == ROLE_BDM:
-        contacted = metrics.get("qualified_leads_contacted", 0)
-        converted = metrics.get("converted_leads", 0)
-        rate = (converted / contacted * 100) if contacted else 0
-        return [(
-            "Conversion rate",
-            f"{rate:.0f}%",
-            f"{converted} converted leads (C) from {contacted} qualified leads contacted (QLC)",
-        )]
+        q = count_stage_events(start_date, end_date, to_stage="Provider Qualified")
+        c = count_stage_events(start_date, end_date, to_stage="Converted/ACTIVE Provider")
+        rate = (c / q * 100) if q else 0
+        return [("LCR", f"{rate:.0f}%", f"{c} Converted (C) from {q} Qualified (Q)")]
     if role == ROLE_MO:
-        verified = metrics.get("verifications_completed", 0)
-        received = metrics.get("converted_leads_received", 0)
-        rate = (verified / received * 100) if received else 0
-        return [(
-            "Verification completion rate",
-            f"{rate:.0f}%",
-            f"{verified} verifications completed (V) from {received} converted leads received for verification (C)",
-        )]
+        rv = count_stage_events(start_date, end_date, sub_stage_contains=SUB_STAGE_VERIFICATION_REQUESTED)
+        v = count_stage_events(start_date, end_date, to_stage="Provider Verified")
+        rate = (v / rv * 100) if rv else 0
+        return [("VCR", f"{rate:.0f}%", f"{v} Verified (V) from {rv} Requests for Verification (RV)")]
     if role == ROLE_PSM:
-        ap = metrics.get("providers_ready_to_activate", 0)
-        v = metrics.get("providers_ready_for_onboarding", 0)
-        activation_rate = (ap / v * 100) if v else 0
-        dap_rate = (dap_today / ap * 100) if ap else 0
+        ro = count_stage_events(start_date, end_date, sub_stage_contains=SUB_STAGE_ONBOARDING_REQUESTED)
+        o = count_stage_events(start_date, end_date, to_stage="Provider Active Onboarded (PAO)")
+        osr = (o / ro * 100) if ro else 0
+        dap_rate = (dap_today / ap_total * 100) if ap_total else 0
         dap_note = " (DAP is a placeholder until Tech connects the provider-app data source)" if dap_today == 0 else ""
         return [
-            (
-                "Activation-ready rate",
-                f"{activation_rate:.0f}%",
-                f"{ap} providers ready to activate (AP) from {v} verified providers ready for onboarding (V)",
-            ),
-            (
-                "DAP coverage",
-                f"{dap_rate:.0f}%",
-                f"{dap_today} daily active providers (DAP) from {ap} providers ready to activate (AP){dap_note}",
-            ),
+            ("OSR", f"{osr:.0f}%", f"{o} Onboarded (O) from {ro} Requests for Onboarding (RO)"),
+            ("DAP Coverage", f"{dap_rate:.0f}%", f"{dap_today} Daily Active Providers (DAP) from {ap_total} Active Providers (AP), total{dap_note}"),
         ]
     if role == ROLE_CEO:
         return [("Management review", "-", "CEO/Admin view")]
     return []
 
 
-def build_scorecards(start_date: date, end_date: date, dap_today: int) -> pd.DataFrame:
-    users = users_frame()
-    # Deactivated accounts remain in the audit trail but are not operational
-    # team members and should not appear on the shared scorecard.
-    users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY)]
-    role_order = {
-        ROLE_ML: 0,
-        ROLE_BDM: 1,
-        ROLE_MO: 2,
-        ROLE_PSM: 3,
-        ROLE_CEO: 4,
-    }
-    users = users.assign(_scorecard_order=users.role.map(role_order).fillna(99))
-    users = users.sort_values(["_scorecard_order", "id"])
-    activities = frame(
-        "SELECT * FROM role_activities WHERE activity_date BETWEEN ? AND ?",
-        (start_date.isoformat(), end_date.isoformat()),
-    )
+def build_scorecards(start_date: date, end_date: date, dap_today: int, ap_total: int) -> pd.DataFrame:
+    """One row per role per KPI - team-wide, not per person, since the
+    underlying counts come from everyone's stage changes in that role."""
     rows = []
-    for user in users.itertuples():
-        metrics, _ = activity_metrics_for_user(activities, user.id)
-        for metric_name, measure, evidence in scorecard_measures(user.role, metrics, dap_today):
-            rows.append({"Team member": f"{user.name}, {user.role}", "Metric": metric_name, "Value": measure, "Evidence": evidence})
+    for role in (ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM, ROLE_CEO):
+        for metric_name, value, evidence in role_kpi(role, start_date, end_date, dap_today, ap_total):
+            rows.append({"Role": role, "KPI": metric_name, "Value": value, "Evidence": evidence})
     return pd.DataFrame(rows)
 
 
-def build_daily_activity_summary(activity_date: date, dap_today: int) -> pd.DataFrame:
-    """Build a shared, read-only daily review for the operational team."""
+def build_daily_activity_summary(activity_date: date) -> pd.DataFrame:
+    """Shared, read-only view of who submitted their manual daily entry
+    (Researches / Calls / Demo supported) on a given date."""
     users = users_frame()
-    users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY)]
-    role_order = {ROLE_ML: 0, ROLE_BDM: 1, ROLE_MO: 2, ROLE_PSM: 3, ROLE_CEO: 4}
+    users = users[(users.is_active == 1) & (users.role != ROLE_DISPLAY) & (users.role != ROLE_CEO)]
+    role_order = {ROLE_ML: 0, ROLE_BDM: 1, ROLE_MO: 2, ROLE_PSM: 3}
     users = users.assign(_daily_order=users.role.map(role_order).fillna(99)).sort_values(["_daily_order", "id"])
     activities = frame(
         "SELECT * FROM role_activities WHERE activity_date=?",
@@ -419,75 +413,70 @@ def build_daily_activity_summary(activity_date: date, dap_today: int) -> pd.Data
     rows = []
     for user in users.itertuples():
         metrics, submitted = activity_metrics_for_user(activities, user.id)
-        if user.role == ROLE_CEO:
-            continue
-        for metric_name, measure, evidence in scorecard_measures(user.role, metrics, dap_today):
-            rows.append(
-                {
-                    "Team member": f"{user.name}, {user.role}",
-                    "Activity submitted": "Yes" if submitted else "No",
-                    "Metric": metric_name,
-                    "Daily measure": measure,
-                    "Evidence": evidence,
-                }
-            )
+        rows.append(
+            {
+                "Role": user.role,
+                "Activity submitted": "Yes" if submitted else "No",
+                "Researches": metrics.get("researches", 0),
+                "Calls": metrics.get("calls", 0),
+                "Demo supported": metrics.get("demos_supported", 0),
+            }
+        )
     return pd.DataFrame(rows)
 
 
 def my_leads_page(user: dict) -> None:
     st.title("My provider leads")
-    # Halifa (Market Lead) is where Lost providers land for re-engagement, so
-    # her queue needs to show them. Every other role's queue hides Lost
+    # Market Intelligence is where Lost providers land for re-engagement, so
+    # their queue needs to show them. Every other role's queue hides Lost
     # providers once they've moved on - they stay visible on the Dashboard
     # and in reports regardless.
     include_lost = user["role"] == ROLE_ML
     if include_lost:
-        st.caption("Providers marked Lost are routed to you here so you can re-engage them. Move a provider back to Interested if you reconnect - it will route straight back to Rahul.")
+        st.caption("Providers marked Lost are routed to you here so you can re-engage them. Move a provider back to Provider Qualified if you reconnect - it will route straight back to Provider Partnerships.")
     else:
-        st.caption("Active provider leads currently assigned to you are listed here. Lost leads are routed to Halifa (Market Lead) for re-engagement and hidden from this list; they remain visible on the Dashboard and in reports.")
+        st.caption("Active provider leads currently assigned to you are listed here. Lost leads are routed to Market Intelligence for re-engagement and hidden from this list; they remain visible on the Dashboard and in reports.")
     query, params = my_provider_query(user, include_lost=include_lost)
     providers = frame(query, params)
-    with st.expander("Add provider lead", expanded=False):
-        with st.form("new_provider", clear_on_submit=True):
-            a, b, c = st.columns(3)
-            company = a.text_input("Provider / organisation name *")
-            provider_type = choose_or_specify("Provider type *", PROVIDER_TYPES, "new_type")
-            contact = c.text_input("Contact person")
-            a, b, c = st.columns(3)
-            phone = a.text_input("Phone")
-            email = b.text_input("Email")
-            source = choose_or_specify("Lead source", SOURCES, "new_source")
-            a, b, c = st.columns(3)
-            stage = "Interested"
-            a.text_input("Current stage", value=stage, disabled=True)
-            priority = b.selectbox("Priority", PRIORITIES, index=1)
-            followup = c.date_input("Next follow-up", value=date.today())
-            notes = st.text_area("Remarks")
-            rahul = owner_for_role(ROLE_BDM)
-            if rahul:
-                st.caption("This qualified lead will be assigned to Rahul automatically.")
-            else:
-                st.warning("Rahul's active account is not available yet. The lead will remain with you until it is assigned.")
-            if st.form_submit_button("Save provider lead", type="primary"):
-                if not company.strip():
-                    st.error("Provider name is required.")
-                else:
-                    owner = rahul
-                    assigned_to, assigned_to_user_id = owner if owner else (user_label(user), user["id"])
-                    execute("""INSERT INTO providers (company_name, provider_type, contact_name, phone, email, source, assigned_to, assigned_to_user_id, created_by_user_id, updated_by_user_id, stage, priority, date_added, next_follow_up, remarks, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, user["id"], user["id"], stage, priority, date.today().isoformat(), followup.isoformat(), notes.strip()))
-                    if owner:
-                        st.success(f"Provider lead saved. Stage set to {stage}. Assigned to Rahul.")
+
+    if user["role"] in (ROLE_ML, ROLE_CEO):
+        with st.expander("Add provider lead", expanded=False):
+            with st.form("new_provider", clear_on_submit=True):
+                a, b, c = st.columns(3)
+                company = a.text_input("Provider / organisation name *")
+                provider_type = choose_or_specify("Provider type *", PROVIDER_TYPES, "new_type")
+                contact = c.text_input("Contact person")
+                a, b, c = st.columns(3)
+                phone = a.text_input("Contact person's phone")
+                org_phone = b.text_input("Organization / individual contact number")
+                email = c.text_input("Email")
+                a, b, c = st.columns(3)
+                source = choose_or_specify("Lead source", SOURCES, "new_source")
+                priority = b.selectbox("Priority", PRIORITIES, index=1)
+                followup = c.date_input("Next follow-up", value=date.today())
+                stage = "Provider Identified"
+                st.text_input("Current stage", value=stage, disabled=True)
+                notes = st.text_area("Remarks")
+                st.caption("This is logged as a Provider Identified / Meaningful Conversation (M) and stays with you until you mark it Qualified.")
+                if st.form_submit_button("Save provider lead", type="primary"):
+                    if not company.strip():
+                        st.error("Provider name is required.")
                     else:
-                        st.success(f"Provider lead saved. Stage set to {stage}. Assign it to Rahul after his account is created.")
-                    st.rerun()
+                        assigned_to, assigned_to_user_id = user["role"], user["id"]
+                        execute("""INSERT INTO providers (company_name, provider_type, contact_name, phone, org_contact_number, email, source, assigned_to, assigned_to_user_id, created_by_user_id, updated_by_user_id, stage, priority, date_added, next_follow_up, remarks, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""", (company.strip(), provider_type, contact.strip(), phone.strip(), org_phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, user["id"], user["id"], stage, priority, date.today().isoformat(), followup.isoformat(), notes.strip()))
+                        new_id = frame("SELECT id FROM providers WHERE company_name=? ORDER BY id DESC LIMIT 1", (company.strip(),)).iloc[0].id
+                        log_stage_change(int(new_id), None, stage, "", user)
+                        st.success(f"Provider lead saved. Stage set to {stage}.")
+                        st.rerun()
+
     st.subheader("My lead register")
     if providers.empty:
         st.info("No leads are assigned to you yet.")
         return
     export_button(providers, "my-provider-leads")
-    show = providers[["id", "company_name", "provider_type", "contact_name", "phone", "source", "stage", "priority", "next_follow_up", "remarks"]].copy()
-    show.columns = ["ID", "Provider", "Type", "Contact", "Phone", "Source", "Stage", "Priority", "Follow-up", "Remarks"]
+    show = providers[["id", "company_name", "provider_type", "contact_name", "phone", "org_contact_number", "source", "stage", "sub_stage", "priority", "next_follow_up", "remarks"]].copy()
+    show.columns = ["ID", "Provider", "Type", "Contact", "Contact phone", "Org phone", "Source", "Stage", "Sub-stage", "Priority", "Follow-up", "Remarks"]
     st.dataframe(show, hide_index=True, width="stretch")
     lead_ids = {int(row.id): f"#{row.id} - {row.company_name}" for row in providers.itertuples()}
     selected_id = st.selectbox("Edit my provider lead", list(lead_ids), format_func=lambda x: lead_ids[x])
@@ -498,8 +487,9 @@ def my_leads_page(user: dict) -> None:
         provider_type = choose_or_specify("Provider type *", PROVIDER_TYPES, f"provider_type_{selected_id}", record.provider_type)
         contact = c.text_input("Contact person", value=record.contact_name or "", key=f"provider_contact_{selected_id}")
         a, b, c = st.columns(3)
-        phone = a.text_input("Phone", value=record.phone or "", key=f"provider_phone_{selected_id}")
-        email = b.text_input("Email", value=record.email or "", key=f"provider_email_{selected_id}")
+        phone = a.text_input("Contact person's phone", value=record.phone or "", key=f"provider_phone_{selected_id}")
+        org_phone = b.text_input("Organization / individual contact number", value=record.org_contact_number or "", key=f"provider_org_phone_{selected_id}")
+        email = c.text_input("Email", value=record.email or "", key=f"provider_email_{selected_id}")
         source = choose_or_specify("Lead source", SOURCES, f"provider_source_{selected_id}", record.source)
         a, b, c = st.columns(3)
         stage_options = allowed_stages_for_role(user, record.stage)
@@ -507,12 +497,33 @@ def my_leads_page(user: dict) -> None:
         priority = b.selectbox("Priority", PRIORITIES, index=PRIORITIES.index(record.priority), key=f"provider_priority_{selected_id}")
         followup = c.date_input("Next follow-up", value=pd.to_datetime(record.next_follow_up).date() if pd.notna(record.next_follow_up) else date.today(), key=f"provider_followup_{selected_id}")
         notes = st.text_area("Remarks", value=record.remarks or "", key=f"provider_notes_{selected_id}")
+
+        # Sub-stage checkboxes: shown per role since Streamlit forms can't
+        # dynamically show/hide fields based on another field's live value
+        # (nothing reruns until the whole form submits). Each is only
+        # actually applied if the stage you submit matches where it belongs.
+        demo_choice = None
+        onboarding_requested = False
+        verification_requested = False
+        if user["role"] in (ROLE_ML, ROLE_CEO):
+            st.caption("Only used if you set the stage above to Provider Qualified:")
+            demo_choice = st.radio(
+                "Demo scheduling", [SUB_STAGE_DEMO_SCHEDULING, SUB_STAGE_DEMO_NOT_SCHEDULING],
+                key=f"demo_choice_{selected_id}", horizontal=True,
+            )
+        if user["role"] in (ROLE_BDM, ROLE_CEO):
+            st.caption("Only used if you set the stage above to Converted/ACTIVE Provider:")
+            d, e = st.columns(2)
+            onboarding_requested = d.checkbox("Request for Onboarding", key=f"onboarding_req_{selected_id}")
+            verification_requested_pp = e.checkbox("Request for Verification", key=f"verification_req_pp_{selected_id}")
+            verification_requested = verification_requested or verification_requested_pp
+        if user["role"] in (ROLE_PSM, ROLE_CEO):
+            st.caption("Only used if you set the stage above to Provider Active Onboarded/Not-Onboarded (PAO/PANO):")
+            verification_requested_ps = st.checkbox("Request for Verification", key=f"verification_req_ps_{selected_id}")
+            verification_requested = verification_requested or verification_requested_ps
+
         if st.form_submit_button("Save my changes", type="primary"):
-            # Ownership only moves automatically at the Verification and
-            # Onboarding handoff points (see workflow_owner_for_stage). Every
-            # other stage change, including Lost and Active Provider, keeps
-            # the provider with its current owner.
-            next_owner = workflow_owner_for_stage(stage)
+            next_owner, sub_stage = resolve_ownership(stage, demo_choice, onboarding_requested, verification_requested)
             assigned_to = next_owner[0] if next_owner else record.assigned_to
             # Cast to a native Python int: pandas returns numpy.int64 here,
             # and passing that straight to sqlite3 silently stores it as a
@@ -522,18 +533,21 @@ def my_leads_page(user: dict) -> None:
             # owner's list on the very next edit. This was the root cause of
             # providers disappearing before their workflow was finished.
             assigned_to_user_id = next_owner[1] if next_owner else int(record.assigned_to_user_id)
-            execute("""UPDATE providers SET company_name=?, provider_type=?, contact_name=?, phone=?, email=?, source=?, assigned_to=?, assigned_to_user_id=?, stage=?, priority=?, next_follow_up=?, remarks=?, last_contact=?, updated_by_user_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""", (company.strip(), provider_type, contact.strip(), phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, stage, priority, followup.isoformat(), notes.strip(), date.today().isoformat(), user["id"], selected_id))
-            if stage != record.stage:
+            execute("""UPDATE providers SET company_name=?, provider_type=?, contact_name=?, phone=?, org_contact_number=?, email=?, source=?, assigned_to=?, assigned_to_user_id=?, stage=?, sub_stage=?, priority=?, next_follow_up=?, remarks=?, last_contact=?, updated_by_user_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""", (company.strip(), provider_type, contact.strip(), phone.strip(), org_phone.strip(), email.strip(), source, assigned_to, assigned_to_user_id, stage, sub_stage, priority, followup.isoformat(), notes.strip(), date.today().isoformat(), user["id"], selected_id))
+            stage_changed = stage != record.stage
+            sub_stage_changed = sub_stage != (record.sub_stage or "")
+            if stage_changed or sub_stage_changed:
+                log_stage_change(int(selected_id), record.stage, stage, sub_stage, user)
+            if stage_changed:
                 if next_owner:
-                    new_owner_name = next_owner[0].split(",")[0].strip()
                     if stage == "Lost":
-                        st.success(f"Stage updated to Lost. Assigned to {new_owner_name} for re-engagement. Hidden from your Provider Leads, but stays visible on the Dashboard and in reports.")
+                        st.success(f"Stage updated to Lost. Assigned to {next_owner[0]} for re-engagement. Hidden from your Provider Leads, but stays visible on the Dashboard and in reports.")
                     else:
-                        st.success(f"Stage updated to {stage}. Assigned to {new_owner_name}.")
-                elif stage == "Lost":
-                    st.success("Stage updated to Lost. Hidden from My provider leads, but stays visible on the Dashboard and in reports.")
+                        st.success(f"Stage updated to {stage}. Assigned to {next_owner[0]}.")
                 else:
                     st.success(f"Stage updated to {stage}.")
+            elif sub_stage_changed:
+                st.success(f"Sub-stage updated to: {sub_stage or '(cleared)'}.")
             else:
                 st.success("Provider lead updated.")
             st.rerun()
@@ -557,7 +571,7 @@ def my_activity_page(user: dict) -> None:
     if not fields:
         st.info("This account does not submit operational activity.")
         return
-    st.caption(f"Your activity is saved as {user_label(user)}. Only you can edit these entries.")
+    st.caption(f"Your activity is saved under your account ({user['role']}). Only you can edit these entries.")
     with st.form("new_activity", clear_on_submit=True):
         activity_date = st.date_input("Activity date", value=date.today())
         columns = st.columns(min(3, len(fields)))
@@ -610,13 +624,13 @@ def my_feedback_page(user: dict) -> None:
         priority = c.selectbox("Priority", PRIORITIES, index=1)
         description = st.text_area("Feedback / issue *")
         tech_owner = st.text_input("Technology owner", value="Tech Team")
-        st.caption(f"Submitted by: {user_label(user)}")
+        st.caption(f"Submitted by: {user['role']}")
         if st.form_submit_button("Save my feedback", type="primary"):
             if not description.strip():
                 st.error("Feedback description is required.")
             else:
                 execute("""INSERT INTO feedback (provider_name, submitted_by, submitted_by_user_id, feedback_date, category, priority, description, assigned_to, status, release_version, updated_by_user_id, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'New', '', ?, CURRENT_TIMESTAMP)""", (provider, user_label(user), user["id"], date.today().isoformat(), category, priority, description.strip(), tech_owner.strip(), user["id"]))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'New', '', ?, CURRENT_TIMESTAMP)""", (provider, user["role"], user["id"], date.today().isoformat(), category, priority, description.strip(), tech_owner.strip(), user["id"]))
                 st.success("Feedback saved.")
                 st.rerun()
     data = frame("SELECT id, feedback_date, provider_name, category, priority, description, assigned_to, status, release_version FROM feedback WHERE submitted_by_user_id=? ORDER BY feedback_date DESC, id DESC", (user["id"],))
@@ -640,63 +654,22 @@ def my_feedback_page(user: dict) -> None:
             st.rerun()
 
 
-def handoffs_page(user: dict) -> None:
-    st.title("Handoff reviews")
-    role = user["role"]
-    if role == ROLE_BDM:
-        queue = frame("""SELECT p.* FROM providers p JOIN users u ON u.id=p.created_by_user_id
-                       WHERE p.stage='Research' AND u.role=? ORDER BY p.date_added""", (ROLE_ML,))
-        heading, handoff_type = "Research leads awaiting outreach review", "Research to outreach"
-    elif role in {ROLE_PSM, ROLE_MO}:
-        queue = frame("""SELECT p.* FROM providers p JOIN users u ON u.id=p.assigned_to_user_id
-                       WHERE p.stage='Demo Scheduled' AND u.role=? ORDER BY p.date_added""", (ROLE_BDM,))
-        heading, handoff_type = "Demo-ready leads awaiting review", "Outreach to demo"
-    else:
-        queue = pd.DataFrame()
-        heading, handoff_type = "No handoff queue for this role", ""
-    st.subheader(heading)
-    if queue.empty:
-        st.info("No handoffs are waiting for your review.")
-    else:
-        st.dataframe(queue[["company_name", "contact_name", "stage", "remarks"]], hide_index=True, width="stretch")
-        options = {int(row.id): f"#{row.id} - {row.company_name}" for row in queue.itertuples()}
-        provider_id = st.selectbox("Select handoff", list(options), format_func=lambda x: options[x])
-        outcome = st.selectbox("Review outcome", ["Accepted", "Needs rework", "Rejected"])
-        evidence = st.text_area("Reason / evidence")
-        if st.button("Save handoff review", type="primary"):
-            submitted = int(queue[queue.id == provider_id].iloc[0].created_by_user_id or queue[queue.id == provider_id].iloc[0].assigned_to_user_id)
-            execute("INSERT INTO handoff_reviews (provider_id, submitted_by_user_id, reviewed_by_user_id, handoff_type, outcome, review_date, evidence) VALUES (?, ?, ?, ?, ?, ?, ?)", (provider_id, submitted, user["id"], handoff_type, outcome, date.today().isoformat(), evidence.strip()))
-            if outcome == "Accepted" and role == ROLE_BDM:
-                execute("UPDATE providers SET assigned_to=?, assigned_to_user_id=?, stage='New Lead', updated_by_user_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (user_label(user), user["id"], user["id"], provider_id))
-            st.success("Handoff review saved.")
-            st.rerun()
-    my_reviews = frame("""SELECT h.review_date, p.company_name, h.handoff_type, h.outcome, h.evidence
-                          FROM handoff_reviews h JOIN providers p ON p.id=h.provider_id
-                          WHERE h.reviewed_by_user_id=? ORDER BY h.review_date DESC, h.id DESC""", (user["id"],))
-    if not my_reviews.empty:
-        st.subheader("My review history")
-        st.dataframe(my_reviews, hide_index=True, width="stretch")
-
-
 def user_management_page(user: dict) -> None:
     st.title("Team access")
-    st.caption("Only Reshma, PSM and CEO/Admin can create local pilot accounts.")
+    st.caption("Only Provider Success and CEO/Admin can create local pilot accounts. Each person keeps their own individual login; only their role is shown elsewhere in the app.")
     with st.form("new_user", clear_on_submit=True):
-        team_options = [f"{name}|{role}" for name, role in DEFAULT_TEAM] + [
-            f"CEO|{ROLE_CEO}",
-            f"LG display|{ROLE_DISPLAY}",
-        ]
-        selected = st.selectbox("Team member", team_options)
-        name, role = selected.split("|", 1)
+        role_options = [ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM, ROLE_PGA, ROLE_CEO, ROLE_DISPLAY]
+        role = st.selectbox("Role", role_options)
+        name = st.text_input("Person's name (for internal records only - not shown elsewhere in the app)")
         email = st.text_input("Work email")
         password = st.text_input("Temporary password", type="password")
         if st.form_submit_button("Create account", type="primary"):
-            if not email.strip() or len(password) < 8:
-                st.error("Enter a work email and a temporary password of at least 8 characters.")
+            if not name.strip() or not email.strip() or len(password) < 8:
+                st.error("Enter their name, a work email, and a temporary password of at least 8 characters.")
             else:
                 try:
-                    create_user(name, role, email, password)
-                    st.success(f"Account created for {name}.")
+                    create_user(name.strip(), role, email, password)
+                    st.success(f"Account created for the {role} role.")
                 except Exception:
                     st.error("An account with that email already exists.")
     accounts = users_frame()
@@ -718,7 +691,7 @@ def user_management_page(user: dict) -> None:
         if selected_account.is_active:
             if st.button("Deactivate selected account", type="secondary"):
                 execute("UPDATE users SET is_active=0 WHERE id=?", (selected_account_id,))
-                st.success(f"{selected_account['name']} has been deactivated.")
+                st.success("The account has been deactivated.")
                 st.rerun()
         else:
             st.info("This account is already deactivated.")
@@ -731,7 +704,7 @@ def main_app() -> None:
     user = current_user()
     with st.sidebar:
         st.title("Qurocare GMS")
-        st.caption(user_label(user))
+        st.caption(user["role"])
         if st.button("Sign out", icon=":material/logout:"):
             st.session_state["gms_user"] = None
             st.rerun()
