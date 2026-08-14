@@ -225,6 +225,11 @@ def initialise() -> None:
         )
         _repair_corrupted_owner_ids(conn)
         _migrate_role_and_stage_names(conn)
+        # Orphaned stage_history rows (from providers deleted before this fix
+        # started cleaning them up too) would otherwise keep silently
+        # counting toward LQR/LCR/OSR/VCR forever. One-time cleanup, safe to
+        # run repeatedly.
+        conn.execute("DELETE FROM stage_history WHERE provider_id NOT IN (SELECT id FROM providers)")
 
 
 def _migrate_role_and_stage_names(conn: sqlite3.Connection) -> None:
@@ -323,6 +328,49 @@ def stage_log_for_user(user_id: int, start_date=None, end_date=None) -> pd.DataF
            ORDER BY sh.changed_at DESC""",
         tuple(params),
     )
+
+
+def export_all_data() -> dict:
+    """Return every row from every table as plain dicts, ready for JSON.
+
+    Streamlit Community Cloud does not guarantee local disk persists (the
+    platform may reset the filesystem at any time - see the note on the
+    login page). Until this moves to a real persistent database, this is
+    the safety net: a full manual backup someone can download and, if a
+    reset happens, reload with import_all_data below.
+    """
+    with connect() as conn:
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()]
+        return {table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()] for table in tables}
+
+
+def import_all_data(data: dict) -> None:
+    """Wipe every table included in a backup and reload it exactly as
+    exported. Destructive by design - this is disaster recovery, not a
+    routine operation. Tables not present in the current schema (e.g. from
+    an older backup) are skipped rather than failing the whole restore.
+    """
+    with connect() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        for table, rows in data.items():
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not exists:
+                continue
+            conn.execute(f"DELETE FROM {table}")
+            if not rows:
+                continue
+            columns = list(rows[0].keys())
+            column_list = ",".join(columns)
+            placeholders = ",".join("?" for _ in columns)
+            conn.executemany(
+                f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
+                [tuple(row.get(col) for col in columns) for row in rows],
+            )
+        conn.commit()
 
 
 def user_count() -> int:
