@@ -11,7 +11,8 @@ from db import (
     ROLE_BDM, ROLE_CEO, ROLE_DISPLAY, ROLE_ML, ROLE_MO, ROLE_PGA, ROLE_PSM, SOURCES, STAGES,
     SUB_STAGE_DEMO_NOT_SCHEDULING, SUB_STAGE_DEMO_SCHEDULING, SUB_STAGE_ONBOARDING_REQUESTED,
     SUB_STAGE_VERIFICATION_REQUESTED, authenticate, count_stage_events, create_user, execute,
-    frame, initialise, log_stage_change, stage_log_for_user, user_count, users_frame,
+    export_all_data, frame, import_all_data, initialise, log_stage_change, stage_log_for_user,
+    user_count, users_frame,
 )
 
 st.set_page_config(page_title="Qurocare GMS", page_icon=":material/health_and_safety:", layout="wide")
@@ -560,6 +561,10 @@ def my_leads_page(user: dict) -> None:
         key=f"confirm_delete_{selected_id}",
     )
     if st.button("Delete provider", type="secondary", disabled=not confirm_delete, key=f"delete_provider_{selected_id}"):
+        # Also remove this provider's stage-change history - otherwise its
+        # old log entries keep silently counting toward the KPIs (LQR, LCR,
+        # OSR, VCR) forever, even though the provider itself is gone.
+        execute("DELETE FROM stage_history WHERE provider_id=?", (selected_id,))
         execute("DELETE FROM providers WHERE id=?", (selected_id,))
         st.success(f"Provider '{record.company_name}' was permanently deleted.")
         st.rerun()
@@ -750,13 +755,48 @@ def user_management_page(user: dict) -> None:
     accounts["access_status"] = accounts.is_active.map({1: "Active", 0: "Deactivated"})
     st.dataframe(accounts.drop(columns=["id", "is_active"]), hide_index=True, width="stretch")
 
+    st.divider()
+    st.subheader("Backup & restore")
+    st.caption(
+        "Streamlit Community Cloud does not guarantee this app's local storage persists - the "
+        "platform can reset it at any time, wiping every account and record. Until this moves to "
+        "a permanent database, download a backup regularly (e.g. once a day) so a reset costs you "
+        "a quick restore instead of rebuilding everything from scratch."
+    )
+    backup_json = json.dumps(export_all_data(), indent=2, default=str)
+    st.download_button(
+        "Download full backup (JSON)",
+        data=backup_json,
+        file_name=f"qurocare-gms-backup-{date.today().isoformat()}.json",
+        mime="application/json",
+        type="primary",
+    )
+
+    st.markdown("**Restore from a backup**")
+    st.warning("This permanently replaces every account and record currently in the app with whatever is in the uploaded file. Only use this right after a reset, to reload your last backup.")
+    uploaded = st.file_uploader("Choose a backup file", type="json", key="restore_backup_uploader")
+    if uploaded is not None:
+        try:
+            backup_data = json.loads(uploaded.read())
+        except Exception:
+            st.error("This file doesn't look like a valid backup (couldn't be read as JSON).")
+        else:
+            confirm_restore = st.checkbox("I understand this will erase everything currently in the app and replace it with this backup.")
+            if st.button("Restore this backup", type="secondary", disabled=not confirm_restore):
+                import_all_data(backup_data)
+                st.success("Backup restored. Please sign in again.")
+                st.session_state["gms_user"] = None
+                st.rerun()
+
 
 def tv_dashboard_page(user: dict) -> None:
-    """Portrait-native summary for the LG TV display: just DAP, AP, and the
-    four core KPIs, computed for today specifically - no date-range picker,
-    no admin detail. A separate view from the full Dashboard so it can use
-    much larger type, sized for reading across a room, and fill a portrait
-    screen without the sidebar/navigation taking up space.
+    """Portrait-native summary for the LG TV display: DAP, AP, and the four
+    core KPIs, computed for yesterday specifically (a completed day's report
+    card, reviewed the next day - not "today so far," which would read 0%
+    for most of every morning) - no date-range picker, no admin detail. A
+    separate view from the full Dashboard so it can use much larger type,
+    sized for reading across a room, and fill a portrait screen without the
+    sidebar/navigation taking up space.
     """
     st.markdown(
         """
@@ -785,12 +825,17 @@ def tv_dashboard_page(user: dict) -> None:
         unsafe_allow_html=True,
     )
 
-    today = date.today()
+    # The manager reviews this as "how did yesterday go," not "how's today
+    # going so far" - today's numbers would mostly read 0% for the first
+    # half of every day until people log activity, which isn't a useful
+    # thing to have on permanent display. AP (a running total) still reflects
+    # right now regardless of which day the KPIs are reporting on.
+    report_date = date.today() - timedelta(days=1)
     dap_today = 0  # placeholder until Tech connects the provider-app data source
     ap_total = active_provider_count()
 
     st.markdown('<div class="tv-header">Qurocare Growth</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="tv-subheader">{today.strftime("%A, %d %B %Y")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="tv-subheader">Yesterday\'s performance &middot; {report_date.strftime("%A, %d %B %Y")}</div>', unsafe_allow_html=True)
     st.markdown(
         f"""
         <div class="tv-bignum-row">
@@ -802,7 +847,7 @@ def tv_dashboard_page(user: dict) -> None:
     )
 
     for role in (ROLE_ML, ROLE_BDM, ROLE_MO, ROLE_PSM):
-        for metric_name, value, evidence in role_kpi(role, today, today, dap_today, ap_total):
+        for metric_name, value, evidence in role_kpi(role, report_date, report_date, dap_today, ap_total):
             st.markdown(
                 f"""
                 <div class="tv-kpi-card">
