@@ -887,7 +887,7 @@ def main_app() -> None:
         if user["role"] == ROLE_PGA:
             pages = ["Dashboard", "My provider leads"]
         else:
-            pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback"]
+            pages = ["Dashboard", "My provider leads", "My activity", "My provider feedback"] 
             if is_management(user):
                 pages.append("Team access")
         page = st.radio("Navigate", pages)
