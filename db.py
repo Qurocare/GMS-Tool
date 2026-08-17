@@ -375,7 +375,7 @@ def import_all_data(data: dict) -> None:
 
 def user_count() -> int:
     with connect() as conn:
-        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] 
 
 
 def create_user(name: str, role: str, email: str, password: str) -> None:
